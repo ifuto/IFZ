@@ -1,18 +1,21 @@
 # IFZ1
 
-Java 21 のみのバイナリ圧縮。依存なし、3 ファイル。
+Java 21 のみのバイナリ圧縮。依存なし、3 ファイル。中身は全部 `ifz/` の下。
 
 ```
-src/ifz/Ifz1.java     圧縮器本体（公開 API は compressBlock / decompressBlock / maxPackedLength）
-src/ifz/IfzGen.java   固定シードのデータ生成器
-src/ifz/IfzBench.java 計測 main（Deflate 比較まで、依存ゼロ）
-bench/IfzVsJzlib.java 純 Java 同士の比較用（jzlib が必要。本体とは別ビルド）
-bench/IfzMem.java     メモリ使用の計測用（本体とは別ビルド）
+ifz/src/ifz/Ifz1.java     圧縮器本体（公開 API は compressBlock / decompressBlock / maxPackedLength）
+ifz/src/ifz/IfzGen.java   固定シードのデータ生成器
+ifz/src/ifz/IfzBench.java 計測 main（Deflate 比較まで、依存ゼロ）
+ifz/bench/IfzVsJzlib.java 純 Java 同士の比較用（jzlib が必要。本体とは別ビルド）
+ifz/bench/IfzMem.java     メモリ使用の計測用（本体とは別ビルド）
 ```
 
 ## 使い方
 
+以下はすべて `ifz/` の中で実行する。
+
 ```
+cd ifz
 javac -encoding UTF-8 -d build src/ifz/*.java
 java -Xms1g -Xmx1g -cp build ifz.IfzBench 12
 ```
@@ -22,7 +25,9 @@ java -Xms1g -Xmx1g -cp build ifz.IfzBench 12
 純 Java 同士の比較を回す場合（jzlib は BSD ライセンス、`third_party/` は git 管理外）:
 
 ```
+cd ifz
 git clone --depth 1 https://github.com/ymnk/jzlib.git /tmp/jzlib
+mkdir -p third_party
 cp -r /tmp/jzlib/src/main/java/com third_party/
 javac -nowarn -d build-jzlib third_party/com/jcraft/jzlib/*.java src/ifz/*.java bench/IfzVsJzlib.java
 java -Xms1g -Xmx1g -cp build-jzlib bench.IfzVsJzlib 12
@@ -31,6 +36,7 @@ java -Xms1g -Xmx1g -cp build-jzlib bench.IfzVsJzlib 12
 メモリ使用の計測:
 
 ```
+cd ifz
 javac -nowarn -encoding UTF-8 -d build src/ifz/*.java bench/IfzMem.java
 java -Xms256m -Xmx256m -cp build bench.IfzMem 1048576
 java -cp build bench.IfzMem probe 1048576
