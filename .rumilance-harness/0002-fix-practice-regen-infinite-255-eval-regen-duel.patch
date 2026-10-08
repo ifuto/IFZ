@@ -1,0 +1,347 @@
+From a8844155e39c058bc912816638b2ce9d238d2032 Mon Sep 17 00:00:00 2001
+From: arena <agent@arena.ai>
+Date: Wed, 7 Oct 2026 22:47:34 +0000
+Subject: [PATCH 2/5] =?UTF-8?q?fix(practice):=20regen=20infinite=20255=20+?=
+ =?UTF-8?q?=20eval=20=E3=81=AE=20regen=20=E9=A0=85=E3=80=81=E3=83=8F?=
+ =?UTF-8?q?=E3=83=BC=E3=83=8D=E3=82=B9=E3=81=AB=E6=88=A6=E3=81=86=E7=9B=B8?=
+ =?UTF-8?q?=E6=89=8B=20(duel)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- マップの npc/function/settings/on/regen_bot は
+  'effect give @a[tag=xlib_bot] regeneration infinite 255 false' を毎 tick 再適用する。
+  前回入れた「ラウンド開始の regen 1 秒」だけでは不足で、被弾 (1 発中央 1.0) が
+  積もって eval が負に落ちていた。参照の実測 (回復 19-20 hp/秒) と一致する形へ修正。
+- eval:stats/hp の regen 項は「自分の regen +50 / 相手の regen -50」。当側は相手のみを
+  見ていて符号も逆だった (常時回復するボットの eval が 50 低く見える)。
+- narena-harness duel on [cadence_ms] [damage]: ダミーを戦う相手にする
+  (3 blk 以内で殴り、遠ければ詰める)。参照の相手は 32.5 回/分 bot を殴っており、
+  棒立ちの的では bot の構造 (移動・パール) が再現できない。
+- 計測: END 直後に trace/samples が出るため fightrun を sleep 3 にしてから切る。
+
+実測 (duel + 常時回復 + eval 修正, 145 s): 連鎖完走 99.4 % / バースト内 place→place
+中央 0.80 s (参照 0.65) / 剣ヒット 63 (参照 63) / クリスタル 33 (参照 33)。
+残るレート差は参照マップの広さ (バースト間は 20-80 blk の移動, 中央 53 blk) 由来で、
+アリーナ半径 40 では構造的に発生しない。
+---
+ docs/parity/plugin_headless_runs.md           |  56 +++++++++
+ .../practice/practice/BotFightHarness.java    | 113 +++++++++++++++++-
+ .../practice/practice/PracticeService.java    |  46 +++++--
+ 3 files changed, 202 insertions(+), 13 deletions(-)
+
+diff --git a/docs/parity/plugin_headless_runs.md b/docs/parity/plugin_headless_runs.md
+index 8bbc6d0..74f339f 100644
+--- a/docs/parity/plugin_headless_runs.md
++++ b/docs/parity/plugin_headless_runs.md
+@@ -628,3 +628,59 @@ fake player) が `eval` を正に固定し続けるため PASSIVE へ落ちな
+ `NumberFormatException` で失敗し、**床が無いまま room が束ねられ**、続く join が
+ `spawn in the void / clone not loaded arena=null` で静かに abort (1 ラウンド丸ごと
+ 空振り)。小数を受けるようにした。
++
++## 計測ツールの再監査と、参照レート差の説明 (2026-10-08)
++
++### 計測系のバグ (数字を誤読しかけた箇所)
++
++1. `plugin_bot_report.py` の `span` が None のまま `max(span, 1.0)` に渡りクラッシュ
++   (END 行も trace も無いログ = 試合中に実行した場合)。警告を出すだけにして 0 扱いに。
++2. 1 ファイルに複数試合が入ると `events` と `duration` が別試合になりレートが混ざる。
++   最後の START..END のみを集計し、警告を出すようにした。
++3. **自己検証**: trace パーサとは別の素朴な部分一致で件数を数え直し、レポートに
++   「自己検証: 生カウント 一致/不一致」として出す。過去に crystal_spawns を時刻でなく
++   添字で数えていた / 参照列をタイマで数えていた類のバグを即検出するため。
++4. `fightrun.sh`/`restore.sh` は END 検出直後にログを切っており、直後に出る trace と
++   samples の末尾が欠けることがあった。3 秒待ってから切るようにした。
++5. 解析中に自前スクリプトで単位ミス (qlog の `t=` は絶対 tick なので、経過秒は
++   `(t - t0)/20`)。最初「被弾 2.5 回/分」と誤読したが、正しくは **32.5 回/分**。
++   統計を出すときは必ず t0 を引く。
++
++### マップが練習 BOT に配る効果 (再確認)
++
++`npc/function/settings/on/regen_bot.mcfunction`:
++`effect give @a[tag=xlib_bot] regeneration infinite 255 false` — 名前も "Bot Regeneration"。
++`npc/function/treats.mcfunction` がこれを毎 tick 再適用する。amp 255 = 1 hp/tick 回復で、
++参照の実測 (qlog run8: 被弾後の回復 19-20 hp/秒、hp 中央 19.6/20、被弾 1 発の中央 1.0) と
++一致する。前節で入れた「ラウンド開始の regen 1 秒」だけでは不足だったので infinite に修正。
++
++`eval:stats/hp` の regen 項も取り違えていた (当側は「相手の regen で +50」):
++マップは **自分の regen で +50 / 相手の regen で −50**。常時回復するボットの eval が
++50 低く見えていた。
++
++### 相手が戦うハーネス (`narena-harness duel on [cadence_ms] [damage]`)
++
++参照の相手は棒立ちの的ではない: 403 秒で bot は 218 回被弾 (32.5 回/分、1 発の中央 1.0)。
++ダミーが殴らないハーネスでは、bot が 2-4.6 blk に張り付いて的を撃ち続ける構造になり、
++参照と比較できない。`duel` はダミーを「3 blk 以内で 1.5 s 間隔に殴り、遠ければ詰める」
++相手にする (ダメージは製品側の `damage()` 経路を通るのでトーテム/無敵時間も効く)。
++
++### 参照とのレート差は「マップの広さ」由来
++
++duel + 常時回復 + eval 修正後の実測 (145 s):
++
++| 指標 | 当側 | 参照 (run8, 403 s) |
++|---|---|---|
++| アンカー設置 | 163 | 117 |
++| 連鎖完走 (charge/place) | 99.4 % | 99.2 % |
++| place→place 中央 (バースト内) | 0.80 s | 0.65 s |
++| 剣ヒット | **63 回** | **63 回** |
++| クリスタル | 33 | 33 |
++
++**行動の「数」はほぼ同じで、試合時間あたりの比 (duty cycle) が違う。** 参照の
++place→place 間隔を分解すると、116 本のうち 80 本が 1.6 s 未満 (中央 0.60 s = バースト)、
++36 本が 1.6 s 以上 (中央 8.9 s) で、**長い間の開始時距離は中央 53 blk** (20-80 blk を
++パールで移動している時間)。当側のアリーナは半径 40 で相手も近くに留まるため、
++この「移動の間」が構造的に発生しない。参照の水晶 4.9/min vs 当側 13.7/min は
++設置ロジックの差ではなく試合地形/移動時間の差である (同一条件の行動回数が一致している
++こと、バースト内間隔 0.80 vs 0.65 s が一致していることが根拠)。
+diff --git a/src/main/java/com/rumilance/practice/practice/BotFightHarness.java b/src/main/java/com/rumilance/practice/practice/BotFightHarness.java
+index 6262c94..f673c65 100644
+--- a/src/main/java/com/rumilance/practice/practice/BotFightHarness.java
++++ b/src/main/java/com/rumilance/practice/practice/BotFightHarness.java
+@@ -16,6 +16,7 @@ import org.bukkit.command.TabCompleter;
+ import org.bukkit.entity.Player;
+ import org.bukkit.plugin.Plugin;
+ import org.bukkit.scheduler.BukkitTask;
++import org.bukkit.util.Vector;
+ import org.jetbrains.annotations.NotNull;
+ 
+ import java.util.ArrayList;
+@@ -66,6 +67,24 @@ public final class BotFightHarness implements CommandExecutor, TabCompleter {
+     /** Top the fake opponent up once it drops to this health (never at full HP, see below). */
+     private static final double DUMMY_HEAL_FLOOR = 4.0d;
+ 
++    // -------- duel: the fake opponent fights back (parity fidelity) ------------------------
++    // 参照 (qlog run8) の相手は「棒立ちの的」ではない: 403 秒の試合で bot は 218 回被弾し
++    // (32.5 回/分、1 発の中央値 1.0 = 0.5 ハート)、54 % の時間 HP が満タンでなかった。
++    // bot の距離も ≤2 blk が 29.5 % / >12 blk が 50.9 % の二峰性で、これは相手の打撃に
++    // よるノックバックと、そこから戻るパールで作られている。相手が殴らないハーネスでは
++    // この構造は原理的に再現できない (当側が 2-4.6 blk に張り付き、アンカーを 52/min で
++    // 打ち続ける「的撃ち」になり、参照の 17.4/min と比較できない)。
++    private boolean duel;
++    /** 1 発の間隔 (ms)。参照の被弾間隔は中央 0.90 s / p90 6.4 s のバースト寄り。 */
++    private long duelCadenceMs = 1500L;
++    /** 1 発のダメージ (Bukkit の HP スケール。参照の中央は 1.0)。 */
++    private double duelDamage = 1.0d;
++    /** 相手が間合いを詰め直す距離 (これより遠いと前進する)。 */
++    private static final double DUEL_CHASE_RANGE = 5.0d;
++    /** 殴れる距離 (バニラのサバイバル攻撃間合い 3.0)。 */
++    private static final double DUEL_REACH = 3.0d;
++    private final Map<String, Long> duelNextAtMs = new HashMap<>();
++
+     /** Arena rim height (blocks) built by {@code ground}: the reference venue is walled. */
+     private static final int WALL_HEIGHT = 6;
+ 
+@@ -113,6 +132,7 @@ public final class BotFightHarness implements CommandExecutor, TabCompleter {
+                 case "ground" -> ground(sender, args);
+                 case "room" -> room(sender, args);
+                 case "dummy" -> dummy(sender, args);
++                case "duel" -> duel(sender, args);
+                 case "fight" -> fight(sender, args);
+                 case "end" -> end(sender);
+                 case "status" -> status(sender);
+@@ -128,8 +148,31 @@ public final class BotFightHarness implements CommandExecutor, TabCompleter {
+ 
+     private static String usage() {
+         return "narena-harness ground <r> <depth> [world] | room <id> <TYPE> <r> <x> <y> <z> | "
+-                + "dummy <name> <x> <y> <z> | fight <TYPE> <secs> [difficulty] [rounds] | "
+-                + "end | status | stop";
++                + "dummy <name> <x> <y> <z> | duel <on|off> [cadence_ms] [damage] | "
++                + "fight <TYPE> <secs> [difficulty] [rounds] | end | status | stop";
++    }
++
++    /**
++     * {@code narena-harness duel on|off [cadence_ms] [damage]} — 相手 (= 偽プレイヤー) を
++     * 戦わせる。参照の相手と同じく、間合いの外では詰め、3.0 blk 以内でバニラ相当の
++     * ダメージとノックバックを与える。数値を参照に合わせるためのハーネス機能で、
++     * 製品の動作には影響しない ({@code -Drumilance.harness=true} が前提)。
++     */
++    private void duel(CommandSender sender, String[] args) {
++        if (args.length < 2) {
++            sender.sendMessage("usage: " + usage());
++            return;
++        }
++        duel = !"off".equalsIgnoreCase(args[1]) && !"0".equals(args[1]);
++        if (args.length > 2) {
++            duelCadenceMs = Math.max(200L, Long.parseLong(args[2]));
++        }
++        if (args.length > 3) {
++            duelDamage = Math.max(0.0d, Double.parseDouble(args[3]));
++        }
++        log("duel " + (duel ? "on" : "off") + " cadence=" + duelCadenceMs + "ms damage="
++                + duelDamage);
++        sender.sendMessage("duel " + (duel ? "on" : "off"));
+     }
+ 
+     private World world(String name) {
+@@ -527,6 +570,9 @@ public final class BotFightHarness implements CommandExecutor, TabCompleter {
+                         }
+                     }
+                 }
++                if (duel) {
++                    tickDuel(name, player);
++                }
+                 double max = Math.max(1.0d, player.getMaxHealth());
+                 if (player.isDead()) {
+                     player.spigot().respawn();
+@@ -540,9 +586,72 @@ public final class BotFightHarness implements CommandExecutor, TabCompleter {
+         }, 1L, 1L);
+     }
+ 
++    // --------------------------------------------------------------------- duel
++    /**
++     * 相手 (偽プレイヤー) を 1 試合ぶん戦わせる: 遠ければ詰め、3.0 blk 以内で 1 発ずつ
++     * 殴る。ダメージは {@code damage(amount, attacker)} で与えるので、被弾処理
++     * (トーテム/無敵時間/装備による軽減) はすべて製品側の経路を通る。ノックバックは
++     * 参照の相手 (通常プレイヤー) と同じバニラ相当の押し出しを手で入れる — 練習 bot は
++     * 非 Player なので {@code EntityKnockbackEvent} のチューニング対象外であり、
++     * ここで速度を書かないと被弾しても位置が動かない。
++     */
++    private void tickDuel(String name, Player dummy) {
++        PacketBotBody body = dummies.get(name);
++        if (body == null) {
++            return;
++        }
++        PracticeSession session = practice.session(dummy.getUniqueId()).orElse(null);
++        BotBody bot = session == null ? null : session.combatBot();
++        if (bot == null || !bot.isValid() || bot.getWorld() != dummy.getWorld()) {
++            return;
++        }
++        Location botLoc = bot.getLocation();
++        Location me = dummy.getLocation();
++        double dist = botLoc.distance(me);
++        long now = System.currentTimeMillis();
++        // 遠ければ詰める (参照の相手は 40 % の時間を 2 blk 以内で過ごす)。
++        if (dist > DUEL_CHASE_RANGE) {
++            Vector to = botLoc.toVector().subtract(me.toVector()).setY(0);
++            if (to.lengthSquared() > 0.01d) {
++                dummy.setVelocity(to.normalize().multiply(0.22d)
++                        .setY(dummy.getVelocity().getY()));
++            }
++            return;
++        }
++        if (dist > DUEL_REACH || !bot.hasLineOfSight(dummy)) {
++            return;
++        }
++        if (now < duelNextAtMs.getOrDefault(name, 0L)) {
++            return;
++        }
++        // バニラの無敵時間: 連打しても 1 発ずつしか通らない (参照の被弾間隔も 0.6-1 s)。
++        org.bukkit.entity.LivingEntity living = bot.living();
++        if (living.getNoDamageTicks() > 0) {
++            return;
++        }
++        dummy.swingMainHand();
++        try {
++            living.damage(duelDamage, dummy);
++        } catch (Throwable t) {
++            log("duel damage failed: " + t.getClass().getSimpleName() + ": " + t.getMessage());
++            duel = false;
++            return;
++        }
++        Vector push = botLoc.toVector().subtract(me.toVector()).setY(0);
++        if (push.lengthSquared() > 0.0001d) {
++            push.normalize().multiply(0.4d).setY(0.36d);
++            bot.setVelocity(push);
++        }
++        // 参照の被弾間隔 (中央 0.90 s / p90 6.4 s) に寄せるため、1 発ごとに少し揺らす。
++        long jitter = java.util.concurrent.ThreadLocalRandom.current().nextLong(
++                Math.max(1L, duelCadenceMs / 2L));
++        duelNextAtMs.put(name, now + duelCadenceMs + jitter);
++    }
++
+     // ------------------------------------------------------------ status / stop
+     private void status(CommandSender sender) {
+         StringBuilder out = new StringBuilder("harness: ");
++        out.append("duel=").append(duel ? "on" : "off").append(' ');
+         out.append("dummies=").append(dummies.size());
+         for (String name : dummies.keySet()) {
+             Player player = dummyPlayer(name);
+diff --git a/src/main/java/com/rumilance/practice/practice/PracticeService.java b/src/main/java/com/rumilance/practice/practice/PracticeService.java
+index 7d5e8f6..4644e22 100644
+--- a/src/main/java/com/rumilance/practice/practice/PracticeService.java
++++ b/src/main/java/com/rumilance/practice/practice/PracticeService.java
+@@ -1586,8 +1586,18 @@ public final class PracticeService {
+      * positive eval (attack) and an HP deficit into a negative one (passive).
+      */
+     private static final double EVAL_HP_FACTOR = 20.0d;
+-    /** Map {@code eval:stats/hp}: +50 while the target is regenerating (our harness opponent). */
+-    private static final double EVAL_TARGET_REGEN_BONUS = 50.0d;
++    /**
++     * Map {@code eval:stats/hp}: 自分の regen で +50、相手の regen で -50。取り違えると符号が
++     * 逆になり、常時回復する練習 BOT の eval が 50 低く見える (実測で state が 3 に落ちる
++     * 原因のひとつ)。マップの実装:
++     * <pre>
++     * execute if predicate quantum:regen run scoreboard players add @s hp 50      (自分の regen)
++     * execute as @p[tag=xlib_target] unless predicate quantum:regen run return 0
++     * scoreboard players remove @s hp 50                                          (相手の regen)
++     * </pre>
++     */
++    private static final double EVAL_REGEN_SELF_BONUS = 50.0d;
++    private static final double EVAL_REGEN_TARGET_PENALTY = 50.0d;
+     /** Map {@code eval:stats/sword/hit} through {@code eval_hit}: can-hit is +2, else -1, *80. */
+     private static final double EVAL_HIT_CAN = 160.0d;
+     private static final double EVAL_HIT_CANNOT = -80.0d;
+@@ -3668,18 +3678,21 @@ public final class PracticeService {
+     }
+ 
+     /**
+-     * マップのラウンド開始 ({@code quantum:map/start2}) が全員に配る 2 つの効果。
++     * マップが練習 BOT に配る効果 (ラウンド開始 + NPC の treats)。
+      *
+      * <pre>
+      * effect give @a regeneration 1 255 true
+      * effect give @a absorption 120 0 true
+      * </pre>
+      *
+-     * <p>参照 (qlog run8) の BOT はこの吸収 4 を持った状態で戦っている。無いと自爆ダメージ
+-     * (アンカー 1 連鎖 0.7 hp) がそのまま積もり、{@code eval} が「相手 20 / 自分 19」で
+-     * 負に落ちて攻撃状態から外れる — 実測で place→place の間隔が中央 1.8 秒 (参照 0.65 秒)、
+-     * 連鎖の最大長が 2 (参照 23) だった。参照の hp が爆発直後に +1/tick で戻るのもこの
+-     * regen (amp 255) で、当側には無かった。</p>
++     * <p>1. ラウンド開始 ({@code quantum:map/start2}): 全員に regen 1 秒 + 吸収 120 秒。
++     * 参照 (qlog run8) の BOT はこの吸収 4 を持った状態で戦っている。</p>
++     *
++     * <p>2. NPC の treats (毎 tick 再適用): 練習 BOT は {@code regeneration infinite 255}
++     * (= 1 hp/tick) を持ち続ける。run8 の実測でも被弾後の回復は 19-20 hp/秒で、hp は
++     * 中央 19.6/20。無いと自爆 0.7 hp や被弾がそのまま積もり、{@code eval} が
++     * 「相手 20 / 自分 19」で負に落ちて攻撃状態から外れる (実測: 試合を丸ごと PASSIVE で
++     * 消費、place→place 中央 1.9 秒 / 連鎖最大 3)。</p>
+      *
+      * <p>プレイヤーには配らない (キット/ロビーの見た目を変えないため)。BOT だけが対象。</p>
+      */
+@@ -3691,9 +3704,15 @@ public final class PracticeService {
+         if (!(entity instanceof org.bukkit.entity.LivingEntity living)) {
+             return;
+         }
+-        // 1 秒だけ amp 255 の回復 (vanilla は amp+1 hp を 50/(amp+1) tick ごと = 毎 tick)。
++        // マップの練習 BOT は常時回復: npc/function/settings/on/regen_bot.mcfunction が
++        // `effect give @a[tag=xlib_bot] regeneration infinite 255 false`、treats.mcfunction が
++        // それを毎 tick 再適用する (toggle 名も "Bot Regeneration")。amp 255 はバニラで
++        // 1 hp/tick 回復なので、参照の被弾 1 発 (中央 1.0) は 1 tick で消える。
++        // 実測 (qlog run8): 被弾後の回復速度は 19-20 hp/秒、hp 中央 19.6/20。
++        // ここを 1 秒だけにすると被弾が積もり、eval が負に落ちて攻撃状態から外れる。
+         living.addPotionEffect(new org.bukkit.potion.PotionEffect(
+-                org.bukkit.potion.PotionEffectType.REGENERATION, 20, 255, false, false, true));
++                org.bukkit.potion.PotionEffectType.REGENERATION,
++                org.bukkit.potion.PotionEffect.INFINITE_DURATION, 255, false, false, true));
+         // 120 秒の吸収 (黄ハート 4)。自爆ダメージはまずここで受け止める。
+         living.addPotionEffect(new org.bukkit.potion.PotionEffect(
+                 org.bukkit.potion.PotionEffectType.ABSORPTION, 20 * 120, 0, false, false, true));
+@@ -4454,8 +4473,13 @@ public final class PracticeService {
+         double hp = bot.getHealth();
+         double targetHp = player.getHealth();
+         double eval = (hp - targetHp) * EVAL_HP_FACTOR;
++        // map eval:stats/hp: 自分の regen は +50、相手の regen は -50 (両方なら差引ゼロ)。
++        if (bot.living() != null && bot.living().hasPotionEffect(
++                org.bukkit.potion.PotionEffectType.REGENERATION)) {
++            eval += EVAL_REGEN_SELF_BONUS;
++        }
+         if (player.hasPotionEffect(org.bukkit.potion.PotionEffectType.REGENERATION)) {
+-            eval += EVAL_TARGET_REGEN_BONUS; // map: `if @p has regeneration` (+50)
++            eval -= EVAL_REGEN_TARGET_PENALTY;
+         }
+         // eval/tick adds the attack bonus AND the hit score only while the bot is already in the
+         // attack branch (`execute if score @s state matches 1..2 ... add @s eval 225`, and
+-- 
+2.39.5
+

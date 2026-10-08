@@ -1,0 +1,63 @@
+From 373774be330aaf87ceac8d77ad8db9dbbd93a873 Mon Sep 17 00:00:00 2001
+From: arena <agent@arena.ai>
+Date: Wed, 7 Oct 2026 22:56:24 +0000
+Subject: [PATCH 5/5] =?UTF-8?q?docs(kbprobe):=20mod=201.0.0=20=E3=81=AE=20?=
+ =?UTF-8?q?Structure=20=E3=81=A8=20weaponStages=20gate=20=E3=81=AE?=
+ =?UTF-8?q?=E5=AF=BE=E5=BF=9C=E3=82=92=E6=A4=9C=E8=A8=BC?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- mod の extra 段は (weaponStages.contains(weapon) ? params[weaponIndex] : 0) + (charged sprint ? sprintStrength : 0)。
+  当側は weaponStrength[武器] != 0 で常に追加段を出すが、追加段を持つ = フィットがその武器を
+  weaponStages に入れた、という Mod の意味なので等価。同梱プロファイルは weaponStrength が空。
+- mod のエクスポート JSON に structure キーは無く、キー構成・14 名は当側 JSON と一致。
+- sprintCharged の式 (gate 0 / gap 0 / gap >= gate) も一致。
+- PacketBot は CraftPlayer なので attackerOf は攻撃者を解決できる (attacker==null は残っていない)。
+---
+ docs/kbprobe1.md | 32 ++++++++++++++++++++++++++++++++
+ 1 file changed, 32 insertions(+)
+
+diff --git a/docs/kbprobe1.md b/docs/kbprobe1.md
+index e780b55..74cf968 100644
+--- a/docs/kbprobe1.md
++++ b/docs/kbprobe1.md
+@@ -156,3 +156,35 @@ Mod は「**ヒットの `groundLagTicks` tick 前**の接地フラグ、また
+ | `sprint-vertical-kb` | (廃止) 追加段の縦は `verticalScaleGround` が掛かる |
+ | `attack-knockback` | (廃止) 1.0 固定。`horizontal-kb` に織り込み済み |
+ | `attack-velocity-influence` / `knockback-direction` / `velocity-clamp` / `knockback-resistance` | (廃止) 新モデルに無い |
++
++## 追加検証: mod 1.0.0 の構造 (Structure) と当側モデルの対応 (2026-10-08)
++
++`kbprobe-1.0.0.jar` の `dev/kbprobe/solve/KbModel$Structure` を逆アセンブルして確認した。
++
++```
++Structure(baseStage, sprintStage, singleFold, groundWindow, sprintGate, weaponStages)
++  initial() = (true, true, false, 0, 0, Set.of())      // Mod の既定
++predict():
++  extra = 0
++  if (weaponStages.contains(weapon) && weaponIndex(weapon) >= 0) extra  = params[weaponIndex]
++  if (attackerSprinting && sprintStage && sprintCharged)         extra += params[P_SPRINT]
++  extra *= max(0, 1 - kbResScale * resist)
++  if (extra != 0) fold(faceX, faceZ, extra)
++```
++
++- `sprintCharged(gap)` = `sprintGate == 0 || gap == null || gap == 0 || gap >= sprintGate` — 当側の
++  `KbProbeProfile.sprintCharged` と一致 (gap 0 = 不明 = gate 通す、も同じ)。
++- **`weaponStrength` の適用条件は「その武器が `weaponStages` に入っていること」**。当側は
++  `weaponStrength[武器] != 0` なら常に追加段を出す。これは等価: 追加段を持つ = フィットが
++  その武器を `weaponStages` に入れた、というのが Mod の意味なので、エクスポートされた JSON の
++  `weaponStrength` に載っている武器は Mod でも常に追加段が出る。同梱の 7 プロファイルは
++  `weaponStrength` が全て空 = 追加段は sprint のみ = Mod 既定 (`Set.of()`) と同じ。
++- Mod の**エクスポート JSON に `structure` キーは無い** (キーは format/exportedAt/
++  minecraftVersion/server/serverName/algorithm/parameters/quality/measurement/notes/
++  vanilla1_21_11/vanillaReference)。当側の `src/main/resources/kb/*.json` は同じキー構成で、
++  `parameters` の 14 名も `FIXED_NAMES` と一致する。singleFold / sprintGate / groundWindow は
++  計測ブロック (`measurement.groundLagTicks` / `groundWindowTicks`) と当側の解釈で持つ。
++- `SPRINT_GATES [0,8,10,11,12,13,14,16]` はフィット時の候補列 (実行時の表ではない)。
++- PacketBot は `extends ServerPlayer` で Bukkit 側は `CraftPlayer` なので、
++  `getDamager() instanceof Player` は真 = `attackerOf` は攻撃者 (パケットボット) を正しく解決する。
++  マネキン経路は `applyBotHitKnockback` がプロファイル式を直接書くので attacker を要らない。
+-- 
+2.39.5
+

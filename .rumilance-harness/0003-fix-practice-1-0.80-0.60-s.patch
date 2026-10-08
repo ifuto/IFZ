@@ -1,0 +1,95 @@
+From 3e3554c2c9764f24419d8e5273e72c49359db23f Mon Sep 17 00:00:00 2001
+From: arena <agent@arena.ai>
+Date: Wed, 7 Oct 2026 22:53:02 +0000
+Subject: [PATCH 3/5] =?UTF-8?q?fix(practice):=20=E7=88=86=E9=A2=A8?=
+ =?UTF-8?q?=E5=BE=8C=E3=81=AE=E5=81=9C=E6=AD=A2=E3=82=92=E7=A7=BB=E5=8B=95?=
+ =?UTF-8?q?=E3=81=A0=E3=81=91=E3=81=AB=E9=99=90=E5=AE=9A=20(=E9=80=A3?=
+ =?UTF-8?q?=E9=8E=96=201=20=E5=91=A8=200.80=20=E2=86=92=200.60=20s)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+段間隔の実測で発見: 爆発 → 次段だけ 0.40 s で他が 0.20 s だった。原因は「自分の爆風の
+直後 350 ms 動かない」処理を tickCrystalBot の return で書いていたこと。マップが
+player @s stop で止めるのは移動だけで、武器モジュール (次段のアンカー・クリスタル・剣) は
+止まらない。速度ゼロにするだけにして return を外した。
+
+段間隔 (最頻): place→charge 0.20 / charge→爆発 0.20 / 爆発→place **0.20** (旧 0.40)。
+連鎖 1 周 0.60 s = マップ INTERMEDIATE の rung 4 tick × 3 = 参照のバースト最頻値と一致。
+145 s 実測: place 203 / charge 203 / 爆発 201 / クリスタル 49 / 剣ヒット 70。
+---
+ docs/parity/plugin_headless_runs.md           | 20 +++++++++++++++++++
+ .../practice/practice/PracticeService.java    | 19 +++++++++++-------
+ 2 files changed, 32 insertions(+), 7 deletions(-)
+
+diff --git a/docs/parity/plugin_headless_runs.md b/docs/parity/plugin_headless_runs.md
+index 74f339f..c88eca6 100644
+--- a/docs/parity/plugin_headless_runs.md
++++ b/docs/parity/plugin_headless_runs.md
+@@ -684,3 +684,23 @@ place→place 間隔を分解すると、116 本のうち 80 本が 1.6 s 未満
+ この「移動の間」が構造的に発生しない。参照の水晶 4.9/min vs 当側 13.7/min は
+ 設置ロジックの差ではなく試合地形/移動時間の差である (同一条件の行動回数が一致している
+ こと、バースト内間隔 0.80 vs 0.65 s が一致していることが根拠)。
++
++### 連鎖の段間隔バグ (kb26 → kb27) — 爆風後の停止が AI 全体を止めていた
++
++段間隔を実測して初めて判明した: 連鎖の各 rung はマップのクールダウンそのまま 4 tick =
++0.20 s のはずが、**爆発 → 次段だけ 0.40 s** あった (place→charge 0.20 / charge→爆発 0.20 /
++爆発→place 0.40)。原因は「自分の爆風の直後 350 ms は動かない」処理を
++`tickCrystalBot` の `return` で書いていたこと。マップが `player @s stop` で止めるのは
++**移動だけ**で、武器モジュールは止まらない。爆風後 350 ms は武器モジュールごと
++止まっていたため、1 周あたり 0.2 s 余計にかかっていた (参照のバースト最頻 0.60 s に対し
++当側 0.80 s)。速度をゼロにするだけにして `return` を外した結果:
++
++| 段間隔 (最頻) | kb26 | kb27 |
++|---|---|---|
++| place → charge | 0.20 s | 0.20 s |
++| charge → 爆発 | 0.20 s | 0.20 s |
++| 爆発 → place | **0.40 s** | **0.20 s** |
++| 連鎖 1 周 | 0.80 s | **0.60 s** |
++
++これで連鎖 1 周が参照のバースト最頻値と一致。145 s の place 数は 163 → 203 に増えたが、
++これは上記の duty cycle の話と同じで、参照は 1 連鎖ごとに 8.9 s 移動しているため。
+diff --git a/src/main/java/com/rumilance/practice/practice/PracticeService.java b/src/main/java/com/rumilance/practice/practice/PracticeService.java
+index 4644e22..4a0536a 100644
+--- a/src/main/java/com/rumilance/practice/practice/PracticeService.java
++++ b/src/main/java/com/rumilance/practice/practice/PracticeService.java
+@@ -5134,15 +5134,20 @@ public final class PracticeService {
+         // Freezing for the whole stage deadlocked the fight: 実測 130 秒 7.5 ブロックで停止、
+         // アンカー 1 個を place したまま charge も起爆も来なかった。
+         boolean holdingChain = ab.anchorStage() > 0 && now < ab.nextAnchorMs();
+-        if (now < ab.blastUntilMs()) {
+-            // 自分の爆風の直後: マップは段の間 `player @s stop` を撃つので、参照の速度は
+-            // 数 tick 0 のまま (run8 実測: 爆発後 7 tick ほど 0.00 -> 0.13 と立ち上がる)。
+-            // ここで AI の移動を載せると 0.6 秒の連鎖が 2 秒に伸びる。
++        // 自分の爆風の直後: マップは段の間 `player @s stop` を撃つので、参照の速度は数 tick
++        // 0 のまま (run8 実測: 爆発後 7 tick ほど 0.00 -> 0.13)。ただし止めるのは **移動だけ**。
++        // ここで tick ごと return していたため、爆風後の 350 ms は武器モジュール
++        // (アンカーの次段・クリスタル・剣) も全部止まり、段間が 0.20 s のはずが
++        // 0.30-0.40 s になっていた (実測 place→charge 0.20 / charge→爆発 0.20 /
++        // 爆発→place **0.40**。連鎖 1 周 0.80 s 対 参照 0.65 s の差の正体)。
++        boolean blastHold = now < ab.blastUntilMs();
++        if (blastHold) {
+             bot.setVelocity(new Vector(0.0d, bot.getVelocity().getY(), 0.0d));
+-            return;
+         }
+-        if (!fights) {
++        if (!fights && !blastHold) {
+             move = new Vector(0, 0, 0);                    // NPC: stand still, just exist
++        } else if (blastHold) {
++            move = new Vector(0, 0, 0);                    // 爆風直後: その場で止まる
+         } else if (dist > FIGHT_STANDOFF && !holdingChain) {
+             move = dir.clone().multiply(0.24d).add(side);  // push forward (map: move forward)
+         } else if (dist < FIGHT_STANDOFF_NEAR) {
+@@ -5153,7 +5158,7 @@ public final class PracticeService {
+         } else {
+             move = side.clone();                           // in the 3-4.5 band: hold + strafe
+         }
+-        if (fights && dist > FIGHT_STANDOFF && bot.isOnGround()
++        if (fights && !blastHold && dist > FIGHT_STANDOFF && bot.isOnGround()
+                 && Math.hypot(bot.getVelocity().getX(), bot.getVelocity().getZ()) < 0.05d) {
+             move.setY(0.42d);                              // blocked by a wall: hop and climb
+         }
+-- 
+2.39.5
+

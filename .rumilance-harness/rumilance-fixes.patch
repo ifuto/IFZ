@@ -1,0 +1,2130 @@
+diff --git a/src/main/java/com/rumilance/practice/combat/CombatStyleService.java b/src/main/java/com/rumilance/practice/combat/CombatStyleService.java
+index 40f96fa..7c4dd9d 100644
+--- a/src/main/java/com/rumilance/practice/combat/CombatStyleService.java
++++ b/src/main/java/com/rumilance/practice/combat/CombatStyleService.java
+@@ -36,8 +36,11 @@ public final class CombatStyleService implements Listener {
+     /** matchId → chosen CombatMode (null = auto / not set → default per-platform). */
+     private final Map<String, CombatMode> matchModes = new ConcurrentHashMap<>();
+ 
+-    /** playerId → CombatMode applied at match start (for reset). */
+-    private final Map<UUID, CombatMode> appliedModes = new ConcurrentHashMap<>();
++    /** playerId → combat mode applied at match start, tagged with the match that applied it. */
++    private final Map<UUID, Applied> appliedModes = new ConcurrentHashMap<>();
++
++    /** One player's applied combat mode: which match owns it, and what it is. */
++    private record Applied(String matchId, CombatMode mode) { }
+ 
+     private final Plugin plugin;
+ 
+@@ -69,22 +72,29 @@ public final class CombatStyleService implements Listener {
+             CombatMode mode = global != null ? global
+                     : CombatMode.defaultFor(PlayerPlatform.of(p));
+             applyToPlayer(p, mode);
++            appliedModes.put(uid, new Applied(matchId, mode));
+         }
+     }
+ 
+     /**
+-     * マッチ終了: 全員をデフォルト攻撃速度に戻し、モード記録を消去。
++     * マッチ終了: <b>このマッチの</b>参加者をデフォルト攻撃速度に戻し、モード記録を消去。
++     * 他のマッチで戦っているプレイヤーには触れない。
+      */
+     public void resetMatch(String matchId) {
+         matchModes.remove(matchId);
+-        // appliedModes からこの match に属していたプレイヤーをリセット
+-        for (Map.Entry<UUID, CombatMode> e : appliedModes.entrySet()) {
++        // Only the players THIS match applied to: the loop used to reset everyone in the map and
++        // then clear it, which reverted players who were mid-fight in another match.
++        for (Map.Entry<UUID, Applied> e : appliedModes.entrySet()) {
++            if (!matchId.equals(e.getValue().matchId())) {
++                continue;
++            }
+             Player p = Bukkit.getPlayer(e.getKey());
+             if (p != null && p.isOnline()) {
+                 resetPlayer(p);
++            } else {
++                appliedModes.remove(e.getKey(), e.getValue());
+             }
+         }
+-        appliedModes.clear();
+     }
+ 
+     /**
+@@ -97,7 +107,6 @@ public final class CombatStyleService implements Listener {
+         // 既存の modifier を全除去してベース値を設定
+         attr.getModifiers().forEach(attr::removeModifier);
+         attr.setBaseValue(target);
+-        appliedModes.put(player.getUniqueId(), mode);
+     }
+ 
+     /**
+@@ -115,7 +124,8 @@ public final class CombatStyleService implements Listener {
+      * プレイヤーに現在適用中のモードを返す（null = 未適用 / デフォルト）。
+      */
+     public CombatMode getAppliedMode(UUID playerId) {
+-        return appliedModes.get(playerId);
++        Applied applied = appliedModes.get(playerId);
++        return applied == null ? null : applied.mode();
+     }
+ 
+     // ---- cross-platform helpers ----
+diff --git a/src/main/java/com/rumilance/practice/combat/LethalPresentationPackets.java b/src/main/java/com/rumilance/practice/combat/LethalPresentationPackets.java
+new file mode 100644
+index 0000000..38262f4
+--- /dev/null
++++ b/src/main/java/com/rumilance/practice/combat/LethalPresentationPackets.java
+@@ -0,0 +1,88 @@
++package com.rumilance.practice.combat;
++
++import com.github.retrooper.packetevents.PacketEvents;
++import com.github.retrooper.packetevents.event.PacketListener;
++import com.github.retrooper.packetevents.event.PacketListenerPriority;
++import com.github.retrooper.packetevents.event.PacketSendEvent;
++import com.github.retrooper.packetevents.protocol.packettype.PacketType;
++import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerDestroyEntities;
++import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerEntityStatus;
++import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerSpawnPlayer;
++import org.bukkit.entity.Player;
++import org.bukkit.plugin.Plugin;
++
++import java.util.Set;
++import java.util.UUID;
++
++/**
++ * PacketEvents side of {@link LethalPresentationService}: the forged death animation, the destroy
++ * packet that drops the victim's entity (and hit box) from the killer's client, and the spawn
++ * packet cut-off that keeps it from coming back.
++ *
++ * <p>Every PacketEvents type the feature needs lives here and nothing else references this class
++ * except {@link LethalPresentationService}, which only ever touches it from inside a
++ * {@code getPlugin("packetevents") != null} check. That is what makes PacketEvents a true soft
++ * dependency: the JVM links interfaces while class-loading, so a class that implements
++ * {@link PacketListener} can never be loaded on a server without the plugin - guarding at call
++ * time is too late.</p>
++ */
++final class LethalPresentationPackets {
++
++    private LethalPresentationPackets() {
++    }
++
++    /** Registers the spawn-packet filter. Only called when PacketEvents is present. */
++    static void register(LethalPresentationService service, Plugin plugin) {
++        PacketEvents.getAPI().getEventManager().registerListener(
++                new Filter(service, plugin), PacketListenerPriority.NORMAL);
++    }
++
++    /** The forged death animation for the killer's client. */
++    static void sendDeathStatus(Player killer, int victimEntityId) {
++        PacketEvents.getAPI().getPlayerManager().sendPacket(killer,
++                new WrapperPlayServerEntityStatus(victimEntityId, LethalPresentationService.DEATH_STATUS));
++    }
++
++    /** Drops the victim's entity - model and hit box - from the killer's client. */
++    static void sendDestroy(Player killer, int targetEntityId) {
++        PacketEvents.getAPI().getPlayerManager().sendPacket(killer,
++                new WrapperPlayServerDestroyEntities(targetEntityId));
++    }
++
++    /**
++     * The packet cut-off: while a victim is staged as dead for a viewer, their spawn packet never
++     * reaches that viewer, so no chunk reload or re-track can bring them back.
++     */
++    private static final class Filter implements PacketListener {
++
++        private final LethalPresentationService service;
++        private final Plugin plugin;
++
++        private Filter(LethalPresentationService service, Plugin plugin) {
++            this.service = service;
++            this.plugin = plugin;
++        }
++
++        @Override
++        public void onPacketSend(PacketSendEvent event) {
++            if (event.getPacketType() != PacketType.Play.Server.SPAWN_PLAYER) {
++                return;
++            }
++            Object receiver = event.getPlayer();
++            if (!(receiver instanceof Player viewer)) {
++                return;
++            }
++            Set<Integer> ids = service.suppressedFor(viewer.getUniqueId());
++            if (ids == null || ids.isEmpty()) {
++                return;
++            }
++            try {
++                if (ids.contains(new WrapperPlayServerSpawnPlayer(event).getEntityId())) {
++                    event.setCancelled(true);
++                }
++            } catch (Throwable t) {
++                service.logPacketFailure("spawn filter failed", t);
++            }
++        }
++    }
++}
+diff --git a/src/main/java/com/rumilance/practice/combat/LethalPresentationService.java b/src/main/java/com/rumilance/practice/combat/LethalPresentationService.java
+index 7667313..b8bec40 100644
+--- a/src/main/java/com/rumilance/practice/combat/LethalPresentationService.java
++++ b/src/main/java/com/rumilance/practice/combat/LethalPresentationService.java
+@@ -1,13 +1,5 @@
+ package com.rumilance.practice.combat;
+ 
+-import com.github.retrooper.packetevents.PacketEvents;
+-import com.github.retrooper.packetevents.event.PacketListener;
+-import com.github.retrooper.packetevents.event.PacketListenerPriority;
+-import com.github.retrooper.packetevents.event.PacketSendEvent;
+-import com.github.retrooper.packetevents.protocol.packettype.PacketType;
+-import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerDestroyEntities;
+-import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerEntityStatus;
+-import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerSpawnPlayer;
+ import org.bukkit.Bukkit;
+ import org.bukkit.entity.Player;
+ import org.bukkit.event.EventHandler;
+@@ -52,9 +44,12 @@ import java.util.logging.Level;
+  * A's side B simply died like on any survival server.</p>
+  *
+  * <p>PacketEvents is a soft dependency: without it only step 2 is lost, and a missing listener
+- * simply means the victim can reappear later rather than the feature breaking.</p>
++ * simply means the victim can reappear later rather than the feature breaking. Every PacketEvents
++ * type this feature needs lives in {@link LethalPresentationPackets}, because a class that
++ * implements a PacketEvents interface cannot even be class-loaded on a server without the plugin -
++ * the JVM resolves the interface before the constructor's presence check ever runs.</p>
+  */
+-public final class LethalPresentationService implements Listener, PacketListener {
++public final class LethalPresentationService implements Listener {
+ 
+     /** Entity Status value that makes the client play the death animation and sound. */
+     public static final int DEATH_STATUS = 3;
+@@ -74,8 +69,9 @@ public final class LethalPresentationService implements Listener, PacketListener
+         boolean pe = false;
+         if (Bukkit.getPluginManager().getPlugin("packetevents") != null) {
+             try {
+-                PacketEvents.getAPI().getEventManager()
+-                        .registerListener(this, PacketListenerPriority.NORMAL);
++                // The packets class names PacketEvents types, so it may only ever be
++                // class-loaded from inside this presence check and inside the catch.
++                LethalPresentationPackets.register(this, plugin);
+                 pe = true;
+             } catch (Throwable t) {
+                 plugin.getLogger().log(Level.WARNING,
+@@ -111,8 +107,7 @@ public final class LethalPresentationService implements Listener, PacketListener
+             try {
+                 // 1. Destroy the entity on A's client — model AND hit box (the F3+B concern).
+                 if (packetEvents) {
+-                    PacketEvents.getAPI().getPlayerManager().sendPacket(killer,
+-                            new WrapperPlayServerDestroyEntities(target.getEntityId()));
++                    LethalPresentationPackets.sendDestroy(killer, target.getEntityId());
+                 }
+                 // 2. Belt and braces: stop the server tracking the entity for A at all.
+                 killer.hideEntity(plugin, target);
+@@ -190,38 +185,20 @@ public final class LethalPresentationService implements Listener, PacketListener
+             return;
+         }
+         try {
+-            PacketEvents.getAPI().getPlayerManager().sendPacket(killer,
+-                    new WrapperPlayServerEntityStatus(victim.getEntityId(), DEATH_STATUS));
++            LethalPresentationPackets.sendDeathStatus(killer, victim.getEntityId());
+         } catch (Throwable t) {
+             plugin.getLogger().log(Level.FINE, "[LethalFx] could not send the death packet", t);
+         }
+     }
+ 
+-    /**
+-     * The packet cut-off: while a victim is staged as dead for a viewer, their spawn packet never
+-     * reaches that viewer, so no chunk reload or re-track can bring them back.
+-     */
+-    @Override
+-    public void onPacketSend(PacketSendEvent event) {
+-        if (suppressed.isEmpty()
+-                || event.getPacketType() != PacketType.Play.Server.SPAWN_PLAYER) {
+-            return;
+-        }
+-        Object receiver = event.getPlayer();
+-        if (!(receiver instanceof Player viewer)) {
+-            return;
+-        }
+-        Set<Integer> ids = suppressed.get(viewer.getUniqueId());
+-        if (ids == null || ids.isEmpty()) {
+-            return;
+-        }
+-        try {
+-            if (ids.contains(new WrapperPlayServerSpawnPlayer(event).getEntityId())) {
+-                event.setCancelled(true);
+-            }
+-        } catch (Throwable t) {
+-            plugin.getLogger().log(Level.FINE, "[LethalFx] spawn filter failed", t);
+-        }
++    /** Entity ids this viewer must not receive spawn packets for (read by the packets class). */
++    Set<Integer> suppressedFor(UUID killerId) {
++        return suppressed.get(killerId);
++    }
++
++    /** Logs a packet-side failure without ever letting it escape into the packet pipeline. */
++    void logPacketFailure(String message, Throwable error) {
++        plugin.getLogger().log(Level.FINE, "[LethalFx] " + message, error);
+     }
+ 
+     /**
+diff --git a/src/main/java/com/rumilance/practice/command/DuelCommand.java b/src/main/java/com/rumilance/practice/command/DuelCommand.java
+index 52f28ad..d230bad 100644
+--- a/src/main/java/com/rumilance/practice/command/DuelCommand.java
++++ b/src/main/java/com/rumilance/practice/command/DuelCommand.java
+@@ -190,7 +190,8 @@ public final class DuelCommand implements CommandExecutor, TabCompleter {
+                 // /duel <player> [kit] sends the request immediately (no GUI).
+                 String kit = args.length > 1 ? args[1].toLowerCase(Locale.ROOT) : firstKit();
+                 if (kitService.get(kit).filter(k -> k.enabled()).isEmpty()) {
+-                    messageService.send(player, "kit.not-found", MessageService.tags("kit", args[1]));
++                    // args[1] does not exist when the kit was defaulted - report the default.
++                    messageService.send(player, "kit.not-found", MessageService.tags("kit", kit));
+                     yield true;
+                 }
+                 sendRequest(player, target, ranked, kit, 1);
+diff --git a/src/main/java/com/rumilance/practice/cosmetic/TrimAllowanceService.java b/src/main/java/com/rumilance/practice/cosmetic/TrimAllowanceService.java
+index b107846..dfa47d8 100644
+--- a/src/main/java/com/rumilance/practice/cosmetic/TrimAllowanceService.java
++++ b/src/main/java/com/rumilance/practice/cosmetic/TrimAllowanceService.java
+@@ -29,7 +29,7 @@ public final class TrimAllowanceService {
+     private final Map<UUID, String> boundByPlayer = new ConcurrentHashMap<>();
+ 
+     public TrimAllowanceService(JavaPlugin plugin, com.rumilance.practice.util.AsyncExecutor pool) {
+-        this.file = new File(plugin.getDataFolder(), "trim-allowance.yml");
++        this.file = com.rumilance.practice.PluginIdentity.dataFile(plugin, "trim-allowance.yml");
+         this.pool = pool;
+         load();
+     }
+diff --git a/src/main/java/com/rumilance/practice/gui/menus/EditKitGui.java b/src/main/java/com/rumilance/practice/gui/menus/EditKitGui.java
+index 57f24b1..28a0ae9 100644
+--- a/src/main/java/com/rumilance/practice/gui/menus/EditKitGui.java
++++ b/src/main/java/com/rumilance/practice/gui/menus/EditKitGui.java
+@@ -1019,9 +1019,12 @@ public final class EditKitGui extends AbstractGui implements BottomInventoryClic
+ 
+     private ItemStack configToggle(Player player, String nameKey, String hintKey, boolean on,
+                                    String action) {
+-        return GuiDecorator.button(on ? Material.LIME_DYE : Material.GRAY_DYE,
+-                Component.text(line(player, nameKey), on ? UiTheme.SUCCESS : UiTheme.MUTED)
+-                        .decoration(TextDecoration.ITALIC, false), action);
++        return ItemBuilder.of(on ? Material.LIME_DYE : Material.GRAY_DYE)
++                .name(Component.text(line(player, nameKey), on ? UiTheme.SUCCESS : UiTheme.MUTED)
++                        .decoration(TextDecoration.ITALIC, false))
++                .lore(UiTheme.divider(), UiTheme.line(line(player, hintKey)))
++                .action(action)
++                .build();
+     }
+ 
+     /**
+diff --git a/src/main/java/com/rumilance/practice/gui/menus/PartyBattleModeGui.java b/src/main/java/com/rumilance/practice/gui/menus/PartyBattleModeGui.java
+index 0801ed4..e602769 100644
+--- a/src/main/java/com/rumilance/practice/gui/menus/PartyBattleModeGui.java
++++ b/src/main/java/com/rumilance/practice/gui/menus/PartyBattleModeGui.java
+@@ -94,7 +94,7 @@ public final class PartyBattleModeGui extends AbstractGui {
+                                 UiTheme.line(line(player, "gui.battle-mode-fight-lore")),
+                                 UiTheme.blank(),
+                                 ffa ? UiTheme.hint(line(player, "menu.click"))
+-                                        : UiTheme.status(line(player, "gui.selected"), UiTheme.SUCCESS))
++                                        : UiTheme.status(line(player, "party.selected"), UiTheme.SUCCESS))
+                         .glint(!ffa)
+                         .action("mode:fight").build());
+         inventory.setItem(GuiSlots.slot(2, 5),
+@@ -104,7 +104,7 @@ public final class PartyBattleModeGui extends AbstractGui {
+                         .lore(UiTheme.divider(),
+                                 UiTheme.line(line(player, "gui.battle-mode-ffa-lore")),
+                                 UiTheme.blank(),
+-                                ffa ? UiTheme.status(line(player, "gui.selected"), UiTheme.SUCCESS)
++                                ffa ? UiTheme.status(line(player, "party.selected"), UiTheme.SUCCESS)
+                                         : UiTheme.hint(line(player, "menu.click")))
+                         .glint(ffa)
+                         .action("mode:ffa").build());
+diff --git a/src/main/java/com/rumilance/practice/gui/menus/SettingsGui.java b/src/main/java/com/rumilance/practice/gui/menus/SettingsGui.java
+index 68e9cc2..3a7a7b4 100644
+--- a/src/main/java/com/rumilance/practice/gui/menus/SettingsGui.java
++++ b/src/main/java/com/rumilance/practice/gui/menus/SettingsGui.java
+@@ -86,7 +86,7 @@ public final class SettingsGui extends AbstractGui {
+     @Override
+     protected Component title(Player player, GuiSession session) {
+         return FunctionalItemListener.stripVariationSelectors(
+-                t(player, "gui.settings-title").color(UiTheme.PRIMARY));
++                t(player, "menu.settings").color(UiTheme.PRIMARY));
+     }
+ 
+     @Override
+diff --git a/src/main/java/com/rumilance/practice/gui/menus/TeamHubGui.java b/src/main/java/com/rumilance/practice/gui/menus/TeamHubGui.java
+index 7eb246f..9c88754 100644
+--- a/src/main/java/com/rumilance/practice/gui/menus/TeamHubGui.java
++++ b/src/main/java/com/rumilance/practice/gui/menus/TeamHubGui.java
+@@ -297,7 +297,7 @@ public final class TeamHubGui extends AbstractGui {
+                         .action("page:next").build());
+         inventory.setItem(GuiSlots.slot(5, 7),
+                 ItemBuilder.of(Material.ARROW)
+-                        .name(t(player, "menu.next").color(UiTheme.MUTED))
++                        .name(t(player, "menu.page-next").color(UiTheme.MUTED))
+                         .action("page:next").build());
+         if (owner) {
+             // OPEN QUESTION (docs/design/gui-json-audit.md): the mockup's row 5 has no cell
+diff --git a/src/main/java/com/rumilance/practice/listener/SessionBootstrapListener.java b/src/main/java/com/rumilance/practice/listener/SessionBootstrapListener.java
+index 0fd5597..8d78471 100644
+--- a/src/main/java/com/rumilance/practice/listener/SessionBootstrapListener.java
++++ b/src/main/java/com/rumilance/practice/listener/SessionBootstrapListener.java
+@@ -133,12 +133,12 @@ public final class SessionBootstrapListener implements Listener {
+         this.chatBanService = chatBanService;
+     }
+ 
+-    @EventHandler(priority = EventPriority.LOWEST)
+     public void setBlockListService(
+             com.rumilance.practice.social.BlockListService blockListService) {
+         this.blockListService = blockListService;
+     }
+ 
++    @EventHandler(priority = EventPriority.LOWEST)
+     public void onJoin(PlayerJoinEvent event) {
+         Player player = event.getPlayer();
+         // Fake players (HeroBot/PacketBot) join through the same event but are not players of this
+diff --git a/src/main/java/com/rumilance/practice/lobby/LobbyService.java b/src/main/java/com/rumilance/practice/lobby/LobbyService.java
+index f0b2a09..9ee5829 100644
+--- a/src/main/java/com/rumilance/practice/lobby/LobbyService.java
++++ b/src/main/java/com/rumilance/practice/lobby/LobbyService.java
+@@ -149,6 +149,10 @@ public final class LobbyService {
+         player.setGameMode(GameMode.ADVENTURE);
+         com.rumilance.practice.util.PlayerVitals.clearCombatState(player);
+         com.rumilance.practice.util.PlayerVitals.resetMaxHealth(player);
++        // Attack speed is not a potion effect, so clearCombatState cannot see it: a match may have
++        // set the Bedrock value (16.0) and every path that skips CombatStyleService.resetMatch -
++        // leaving a match early, a restart mid-match - would keep it, permanently once saved.
++        com.rumilance.practice.util.PlayerVitals.resetAttackSpeed(player);
+         player.setFoodLevel(20);
+         player.setSaturation(20f);
+         player.setAllowFlight(false);
+diff --git a/src/main/java/com/rumilance/practice/match/MatchService.java b/src/main/java/com/rumilance/practice/match/MatchService.java
+index d10c507..ea63475 100644
+--- a/src/main/java/com/rumilance/practice/match/MatchService.java
++++ b/src/main/java/com/rumilance/practice/match/MatchService.java
+@@ -133,8 +133,15 @@ public final class MatchService {
+      *  ruling tell a true mutual kill (each player died to the OTHER player) apart from a
+      *  suicide/environmental death that merely shares a tick — only the former is a draw. */
+     private final Map<UUID, Map<UUID, UUID>> lethalAttackerByMatch = new ConcurrentHashMap<>();
+-    /** Count of matches that hit the absolute 1-hour hard limit (per player). 3 = 4-day ban. */
+-    private final Map<UUID, Integer> hardTimeoutStrikes = new ConcurrentHashMap<>();
++    /**
++     * Forced 1-hour draws per player, with the time of the last one. 3 inside
++     * {@link #HARD_TIMEOUT_STRIKE_WINDOW_MS} = 4-day ban; the count starts over once the window
++     * has passed, or the moment the ban is issued.
++     */
++    private final Map<UUID, HardTimeoutStrike> hardTimeoutStrikes = new ConcurrentHashMap<>();
++
++    /** One player's forced draws: {@code count} falls back to 1 when the last one is too old. */
++    private record HardTimeoutStrike(int count, long lastAtMs) { }
+     /** Matches already ruled by the hard 1-hour limit, so it never fires twice. */
+     private final java.util.Set<UUID> hardTimedOut = ConcurrentHashMap.newKeySet();
+     /** Per-match hard-cap task (independent of the normal timeout task keyed in {@link #tasks}). */
+@@ -142,6 +149,8 @@ public final class MatchService {
+     /** Absolute cap that always applies even when no admin timeout is configured. */
+     private static final int HARD_TIMEOUT_SECONDS = 60 * 60;
+     private static final int HARD_TIMEOUT_STRIKES_BAN = 3;
++    /** Older forced draws are forgotten: the ban is for stalling, not for ancient history. */
++    private static final long HARD_TIMEOUT_STRIKE_WINDOW_MS = 7L * 24 * 60 * 60 * 1000;
+     private static final java.time.Duration HARD_TIMEOUT_BAN = java.time.Duration.ofDays(4);
+     /** Fighters whose lethal has already been processed this match — guards against a second
+      *  lethal event for the same player (double damage events in the 1-tick resolution window). */
+@@ -1946,7 +1955,17 @@ public final class MatchService {
+                                     "Match hit the 1 hour limit — forced draw.", NamedTextColor.YELLOW));
+                         }
+                     }
+-                    int strikes = hardTimeoutStrikes.merge(id, 1, Integer::sum);
++                    long nowMs = System.currentTimeMillis();
++                    HardTimeoutStrike previous = hardTimeoutStrikes.get(id);
++                    int strikes = previous == null
++                            || nowMs - previous.lastAtMs() > HARD_TIMEOUT_STRIKE_WINDOW_MS
++                            ? 1
++                            : previous.count() + 1;
++                    // Starting a fresh window on the third strike: the count used to sit at 3+
++                    // forever, so every later forced draw re-banned the player without them
++                    // earning three new stall reports first.
++                    hardTimeoutStrikes.put(id, new HardTimeoutStrike(
++                            strikes >= HARD_TIMEOUT_STRIKES_BAN ? 0 : strikes, nowMs));
+                     if (strikes >= HARD_TIMEOUT_STRIKES_BAN && chatBanService != null) {
+                         Player online = Bukkit.getPlayer(id);
+                         if (online == null || !online.hasPermission("rumilance.punishment.bypass")) {
+diff --git a/src/main/java/com/rumilance/practice/practice/BotFightHarness.java b/src/main/java/com/rumilance/practice/practice/BotFightHarness.java
+index f4fa3a2..2722008 100644
+--- a/src/main/java/com/rumilance/practice/practice/BotFightHarness.java
++++ b/src/main/java/com/rumilance/practice/practice/BotFightHarness.java
+@@ -256,7 +256,7 @@ public final class BotFightHarness implements CommandExecutor, TabCompleter {
+         }
+         PacketBotBody body = PacketBotFactory.spawnDummy(new Location(w, x, y, z), name, 20.0d);
+         dummies.put(name, body);
+-        Player player = Bukkit.getPlayerExact(name);
++        Player player = dummyPlayer(name);
+         if (player != null) {
+             stateManager.resetToLobby(player.getUniqueId());
+             // The dummy's game type follows the server's own default (this harness server
+@@ -310,9 +310,30 @@ public final class BotFightHarness implements CommandExecutor, TabCompleter {
+         startRound(type, difficulty, seconds, roomId, dummyName, left, sender);
+     }
+ 
++    /**
++     * The Player behind a dummy label. A fake player is registered under a generated profile
++     * name (NARENA_BOT_xxxxx), so {@code Bukkit.getPlayerExact(label)} never matched and every
++     * branch guarded by it was dead code: the rounds reported "dummy offline" and never started,
++     * and the gamemode reset after spawning never ran (leaving the dummy in the server's default
++     * game mode, where it cannot be hurt at all).
++     */
++    private Player dummyPlayer(String label) {
++        PacketBotBody body = dummies.get(label);
++        if (body == null) {
++            return null;
++        }
++        try {
++            Player player = (Player) body.bot().getBukkitEntity();
++            return player != null && player.isOnline() ? player : null;
++        } catch (Throwable ignored) {
++            // Removed entity / shutdown race: treat the dummy as offline.
++            return null;
++        }
++    }
++
+     private void startRound(PracticeType type, BotDifficulty difficulty, int seconds, String roomId,
+                             String dummyName, int[] left, CommandSender sender) {
+-        Player player = Bukkit.getPlayerExact(dummyName);
++        Player player = dummyPlayer(dummyName);
+         if (player == null || !player.isOnline()) {
+             sender.sendMessage("dummy offline: " + dummyName);
+             return;
+@@ -391,7 +412,7 @@ public final class BotFightHarness implements CommandExecutor, TabCompleter {
+     private void end(CommandSender sender) {
+         int ended = 0;
+         for (String name : dummies.keySet()) {
+-            Player player = Bukkit.getPlayerExact(name);
++            Player player = dummyPlayer(name);
+             if (player == null) {
+                 continue;
+             }
+@@ -471,7 +492,7 @@ public final class BotFightHarness implements CommandExecutor, TabCompleter {
+         }
+         keepAliveTask = Bukkit.getScheduler().runTaskTimer(plugin, () -> {
+             for (String name : List.copyOf(dummies.keySet())) {
+-                Player player = Bukkit.getPlayerExact(name);
++                Player player = dummyPlayer(name);
+                 if (player == null || !player.isOnline()) {
+                     continue;
+                 }
+@@ -521,7 +542,7 @@ public final class BotFightHarness implements CommandExecutor, TabCompleter {
+         StringBuilder out = new StringBuilder("harness: ");
+         out.append("dummies=").append(dummies.size());
+         for (String name : dummies.keySet()) {
+-            Player player = Bukkit.getPlayerExact(name);
++            Player player = dummyPlayer(name);
+             out.append(" [").append(name).append(player == null ? " offline" : " online hp="
+                     + String.format(Locale.ROOT, "%.1f", player.getHealth()));
+             if (player != null) {
+@@ -562,7 +583,7 @@ public final class BotFightHarness implements CommandExecutor, TabCompleter {
+         }
+         List<String> names = new ArrayList<>(dummies.keySet());
+         for (String name : names) {
+-            Player player = Bukkit.getPlayerExact(name);
++            Player player = dummyPlayer(name);
+             if (player != null) {
+                 practice.session(player.getUniqueId()).ifPresent(session -> practice.leave(player, false));
+             }
+diff --git a/src/main/java/com/rumilance/practice/practice/PracticeService.java b/src/main/java/com/rumilance/practice/practice/PracticeService.java
+index ebec5fb..d47dff3 100644
+--- a/src/main/java/com/rumilance/practice/practice/PracticeService.java
++++ b/src/main/java/com/rumilance/practice/practice/PracticeService.java
+@@ -1881,14 +1881,29 @@ public final class PracticeService {
+                 player.getInventory().setChestplate(new ItemStack(Material.ELYTRA));
+                 session.setDrillElytraDressed(true);
+             }
+-            case CRYSTAL_LEDGE ->
++            case CRYSTAL_LEDGE -> {
++                dressSlowFalling(player, session);
+                 player.addPotionEffect(new org.bukkit.potion.PotionEffect(
+                         org.bukkit.potion.PotionEffectType.SLOW_FALLING,
+                         org.bukkit.potion.PotionEffect.INFINITE_DURATION, 0, false, false, true));
++            }
+             default -> { }
+         }
+     }
+ 
++    /**
++     * Gives the player the ledge drill's slow falling, remembering whatever they had before so
++     * teardown can put it back.
++     */
++    private void dressSlowFalling(Player player, PracticeSession session) {
++        if (session.drillSlowFallingDressed()) {
++            return;
++        }
++        session.setDrillSavedSlowFalling(
++                player.getPotionEffect(org.bukkit.potion.PotionEffectType.SLOW_FALLING));
++        session.setDrillSlowFallingDressed(true);
++    }
++
+     /** Undoes player-side drill sculpting (elytra swap, effects). Safe at any time. */
+     private void restoreDrillSideEffects(Player player, PracticeSession session) {
+         if (session != null && session.drillElytraDressed()) {
+@@ -1898,6 +1913,18 @@ public final class PracticeService {
+             session.setDrillElytraDressed(false);
+             session.setDrillSavedChest(null);
+         }
++        if (session != null && session.drillSlowFallingDressed()) {
++            // The drill hands out slow falling with INFINITE_DURATION - without this the player
++            // never falls again: leaving the room, switching to a normal fight or quitting to the
++            // lobby all kept it, and the effect even survived into later matches.
++            player.removePotionEffect(org.bukkit.potion.PotionEffectType.SLOW_FALLING);
++            org.bukkit.potion.PotionEffect before = session.drillSavedSlowFalling();
++            if (before != null) {
++                player.addPotionEffect(before);
++            }
++            session.setDrillSlowFallingDressed(false);
++            session.setDrillSavedSlowFalling(null);
++        }
+     }
+ 
+     private void drillResult(Player player, PracticeSession session) {
+@@ -2084,6 +2111,7 @@ public final class PracticeService {
+             });
+             case CRYSTAL_LEDGE -> {
+                 if (!player.hasPotionEffect(org.bukkit.potion.PotionEffectType.SLOW_FALLING)) {
++                    dressSlowFalling(player, session);
+                     player.addPotionEffect(new org.bukkit.potion.PotionEffect(
+                             org.bukkit.potion.PotionEffectType.SLOW_FALLING, 20 * 30, 0,
+                             false, false, true));
+diff --git a/src/main/java/com/rumilance/practice/practice/PracticeSession.java b/src/main/java/com/rumilance/practice/practice/PracticeSession.java
+index efb0843..27fd645 100644
+--- a/src/main/java/com/rumilance/practice/practice/PracticeSession.java
++++ b/src/main/java/com/rumilance/practice/practice/PracticeSession.java
+@@ -86,6 +86,12 @@ public final class PracticeSession {
+     /** Player's chest item swapped away by the divebomb drill (restored on teardown). */
+     private org.bukkit.inventory.ItemStack drillSavedChest;
+     private boolean drillElytraDressed;
++    /**
++     * Player's slow-falling effect swapped away by the ledge drill, or {@code null} if the drill
++     * added it from nothing (restored/removed on teardown).
++     */
++    private org.bukkit.potion.PotionEffect drillSavedSlowFalling;
++    private boolean drillSlowFallingDressed;
+ 
+     /** A block a bot placed mid-fight: after {@code ttlMs} it is reverted to AIR. */
+     public record BotBlock(org.bukkit.Material type, long atMs, long ttlMs) {
+@@ -607,6 +613,22 @@ public final class PracticeSession {
+         return drillElytraDressed;
+     }
+ 
++    public org.bukkit.potion.PotionEffect drillSavedSlowFalling() {
++        return drillSavedSlowFalling;
++    }
++
++    public void setDrillSavedSlowFalling(org.bukkit.potion.PotionEffect effect) {
++        this.drillSavedSlowFalling = effect;
++    }
++
++    public boolean drillSlowFallingDressed() {
++        return drillSlowFallingDressed;
++    }
++
++    public void setDrillSlowFallingDressed(boolean dressed) {
++        this.drillSlowFallingDressed = dressed;
++    }
++
+     public void setDrillElytraDressed(boolean drillElytraDressed) {
+         this.drillElytraDressed = drillElytraDressed;
+     }
+diff --git a/src/main/java/com/rumilance/practice/queue/QueueService.java b/src/main/java/com/rumilance/practice/queue/QueueService.java
+index 096ee17..f62740a 100644
+--- a/src/main/java/com/rumilance/practice/queue/QueueService.java
++++ b/src/main/java/com/rumilance/practice/queue/QueueService.java
+@@ -223,6 +223,14 @@ public final class QueueService {
+         for (List<QueueEntry> list : byQueue.values()) {
+             list.removeIf(e -> org.bukkit.Bukkit.getPlayer(e.playerId()) == null);
+         }
++        // The recent-opponent block only means anything while BOTH fighters are still online: it
++        // stops an instant rematch against the person you just fought. Nothing ever removed these
++        // entries, so one match permanently blocked that pair (a player who logged out for the
++        // night came back still unable to meet their last opponent) and the map grew one entry per
++        // player ever matched, forever.
++        recentOpponents.entrySet().removeIf(e ->
++                org.bukkit.Bukkit.getPlayer(e.getKey()) == null
++                        || org.bukkit.Bukkit.getPlayer(e.getValue()) == null);
+     }
+ 
+     public synchronized List<MatchPair> pollMatches(boolean blockSameIp, boolean avoidRecent, Instant now) {
+diff --git a/src/main/java/com/rumilance/practice/util/PlayerVitals.java b/src/main/java/com/rumilance/practice/util/PlayerVitals.java
+index 3f1c5c6..6a6d75a 100644
+--- a/src/main/java/com/rumilance/practice/util/PlayerVitals.java
++++ b/src/main/java/com/rumilance/practice/util/PlayerVitals.java
+@@ -114,6 +114,33 @@ public final class PlayerVitals {
+         refillHealth(player);
+     }
+ 
++    /**
++     * Reset the ATTACK_SPEED attribute to the Java default (4.0) and drop any modifiers.
++     *
++     * <p>Attack speed is the one combat attribute the lobby has to undo by hand: matches may set
++     * it to the Bedrock value (16.0, see {@code CombatStyleService}) and a player who leaves a
++     * match early - or a server that restarts mid-match - skips that service's own reset. Vanilla
++     * persists attribute base values in the player's file, so without this the player keeps the
++     * no-cooldown attack speed across a restart until some later match overwrites it.</p>
++     */
++    public static void resetAttackSpeed(Player player) {
++        if (player == null) {
++            return;
++        }
++        try {
++            org.bukkit.attribute.AttributeInstance speedAttr =
++                    player.getAttribute(org.bukkit.attribute.Attribute.ATTACK_SPEED);
++            if (speedAttr != null) {
++                // Mirrors CombatStyleService.resetPlayer: attack speed belongs to the combat
++                // system, so every modifier on it is ours to remove.
++                speedAttr.getModifiers().forEach(speedAttr::removeModifier);
++                speedAttr.setBaseValue(4.0d);
++            }
++        } catch (RuntimeException | NoSuchFieldError | NoClassDefFoundError ignored) {
++            // Older/newer servers without the attribute: nothing to reset.
++        }
++    }
++
+     /** Reset a team-config body-size SCALE attribute back to the vanilla 1.0. */
+     public static void resetScale(Player player) {
+         if (player == null) {
+diff --git a/src/main/resources/lang/en_gb.yml b/src/main/resources/lang/en_gb.yml
+index 8c268cb..a9d737b 100644
+--- a/src/main/resources/lang/en_gb.yml
++++ b/src/main/resources/lang/en_gb.yml
+@@ -81,8 +81,8 @@ menu:
+   save: "Save"
+   apply: "Apply"
+   confirm: "Confirm"
+-  yes: "Yes"
+-  no: "No"
++  "yes": "Yes"
++  "no": "No"
+   delete: "Delete"
+ 
+ party:
+@@ -213,7 +213,6 @@ party:
+   decline-hover: "Decline this invite"
+   no-team-named: "<red>No public party named '<name>'."
+   joined: "<aqua><player> joined the party."
+-  same-ip-notice: "<yellow>A player from the same connection is waiting in this ranked queue; same-IP players never pair in ranked."
+ 
+   declined-owner: "<yellow><player> declined the invite."
+   declined-self: "<grey>Invite declined."
+@@ -308,6 +307,9 @@ party:
+   hotbar-settings: "Party Settings"
+   hotbar-settings-hint: "Owner only — rules and danger zone"
+ 
++  invite-online-label: "Available online"
++  invite-sent: "Invite sent — click again to cancel"
++  invite-revoke-hint: "Click: cancel the invite"
+ general:
+   prefix: ""
+   maintenance: "<red>Practice is currently in maintenance mode."
+@@ -321,16 +323,6 @@ general:
+   loading: "<grey>Loading, please wait..."
+   mode-ranked: "ranked"
+   mode-unranked: "unranked"
+-  kb-select: "<white>KB: <kb>"
+-  kb-default-name: "Default (default KB: <name>)"
+-  kb-off-name: "No KB change"
+-  kb-title: "KB Profile"
+-  kb-select-lore: "<gray>Click to pick from the list."
+-  kb-default-lore: "<gray>Fight with the server default KB."
+-  kb-off-lore: "<gray>Apply no profile — plain knockback rules."
+-  kb-profile-lore: "<gray>Horizontal ×<h> / Vertical ×<v>"
+-  kb-empty: "No profiles installed"
+-  kb-empty-lore: "<gray>Drop profile JSONs into plugins/n-arena/kb/."
+ 
+ 
+ duel:
+@@ -393,6 +385,16 @@ duel-gui:
+   combat-mode-lore-java: "Java: cooldown, sweep attacks."
+   combat-mode-lore-bedrock: "Bedrock: fast clicks, no cooldown."
+ 
++  kb-select: "<white>KB: <kb>"
++  kb-default-name: "Default (default KB: <name>)"
++  kb-off-name: "No KB change"
++  kb-title: "KB Profile"
++  kb-select-lore: "<gray>Click to pick from the list."
++  kb-default-lore: "<gray>Fight with the server default KB."
++  kb-off-lore: "<gray>Apply no profile — plain knockback rules."
++  kb-profile-lore: "<gray>Horizontal ×<h> / Vertical ×<v>"
++  kb-empty: "No profiles installed"
++  kb-empty-lore: "<gray>Drop profile JSONs into plugins/n-arena/kb/."
+ ffa:
+   maintenance: "<red>Practice is currently in maintenance mode."
+   unavailable: "<red>FFA is currently unavailable."
+@@ -482,6 +484,7 @@ queue:
+   kit-disabled: "<red>That kit queue is currently disabled."
+   cannot-join: "<red>You cannot join a queue right now."
+   already-queued: "<red>You are already in a queue."
++  same-ip-notice: "<yellow>A player from the same connection is waiting in this ranked queue; same-IP players never pair in ranked."
+   slow-down: "<red>Easy there — try that again in a moment."
+   high-ping: "<red>Your ping (<ping>ms) is too high for ranked (max <max>ms)."
+   ranked-locked: "<red>Ranked queue is currently locked. (<count>/<threshold> unique players joined)"
+@@ -1147,21 +1150,21 @@ gui:
+   party-danger: "Danger Settings"
+   party-danger-lore: "Transfer ownership, disband the party, reset teams."
+   update-data: "Update Data"
+-  gui.party-launch-title: "Party Battle"
+-  gui.party-launch-kit: "Select a Kit"
+-  gui.party-launch-kit-lore: "Opens the classic kit picker — the red-vs-blue battle starts on pick."
+-  gui.party-launch-mode: "Select a Battle Mode"
+-  gui.party-launch-mode-lore: "Party Fight (red vs blue) or Party FFA."
+-  gui.party-launch-mode-current: "Mode: <mode>"
+-  gui.battle-mode-fight: "Party Fight"
+-  gui.battle-mode-fight-lore: "The classic party battle: red vs blue with your kit and map."
+-  gui.battle-mode-ffa: "Party FFA"
+-  gui.battle-mode-ffa-lore: "Private FFA: the whole party fights free-for-all in its own zone."
+-  gui.party-launch-go: "Start Battle"
+-  gui.party-launch-go-fight-lore: "Starts the red-vs-blue party fight."
+-  gui.party-launch-go-ffa-lore: "Sends the whole party into the private FFA."
+-  gui.party-ffa-too-few: "<red>Party FFA needs at least 2 free members.</red>"
+-  gui.party-ffa-failed: "<red>Could not start the Party FFA.</red>"
++  party-launch-title: "Party Battle"
++  party-launch-kit: "Select a Kit"
++  party-launch-kit-lore: "Opens the classic kit picker — the red-vs-blue battle starts on pick."
++  party-launch-mode: "Select a Battle Mode"
++  party-launch-mode-lore: "Party Fight (red vs blue) or Party FFA."
++  party-launch-mode-current: "Mode: <mode>"
++  battle-mode-fight: "Party Fight"
++  battle-mode-fight-lore: "The classic party battle: red vs blue with your kit and map."
++  battle-mode-ffa: "Party FFA"
++  battle-mode-ffa-lore: "Private FFA: the whole party fights free-for-all in its own zone."
++  party-launch-go: "Start Battle"
++  party-launch-go-fight-lore: "Starts the red-vs-blue party fight."
++  party-launch-go-ffa-lore: "Sends the whole party into the private FFA."
++  party-ffa-too-few: "<red>Party FFA needs at least 2 free members.</red>"
++  party-ffa-failed: "<red>Could not start the Party FFA.</red>"
+   party-none-lore: "Use the buttons above to create one"
+   admin-hub-lore-1: "Day-to-day setup is done from this UI"
+   admin-hub-lore-2: "Commands are for emergencies and advanced settings"
+@@ -1465,6 +1468,33 @@ gui:
+   request-inbox-duel-raison: "Ranked / Unranked"
+   request-inbox-duel-hint: "Left-click to accept, right-click to deny"
+   request-inbox-generic-hint: "Left-click to accept, right-click to deny"
++# start-effects deposit UI (en fallback)
++  kit-save-done: "Kit saved"
++  start-effects-hint: "Put your potions here"
++  start-effects-hint-lore-1: "Drop normal/splash/lingering potions into the band above,"
++  start-effects-hint-lore-2: "then press Save — effect, level and duration are kept."
++  start-effects-save: "Save (apply effects)"
++  start-effects-clear: "Clear all"
++  start-effects-saved: "Start effects saved: <n> kind(s) / <rejected> non-potion item(s) returned"
++  trim-free-kit-bound: "Free perk: kit “<kit>” is now your full-trim slot"
++  trim-free-note-unset: "Free perk: VIP trim range on ONE kit of your choice (locks on first apply)"
++  trim-free-note-bound: "Free perk slot: VIP range only on “<kit>”"
++  party-map-chip: "Change map"
++  party-map-chip-hint: "Click: pick a party map (does not start the battle)"
++  party-map-click: "Click: pick this map (back to kit select)"
++  party-start-kit: "Start battle: <kit>"
++  party-start-orig: "Start battle: my Original Kit"
++  party-selected-orig: "Selected: owner’s Original Kit (rules included)"
++  party-selected-inner: "Preset: <inner>"
++  party-pick-first: "Pick a kit first (click one)!"
++  party-select-click: "Click: select → press START to begin"
++  kit: "Kit"
++  ranking: "Ranking"
++  percentile: "Percentile"
++  battle-mode-title: "Battle Mode"
++  party-launch-map: "Select a Map"
++  preset-removable-hint: "Players may delete this preset item"
++  preset-more-enchant-hint: "Also usable as an enchantment ingredient"
+ lb:
+   kill-title: "<gold><b>Monthly Kill Ranking</b></gold>"
+   streak-title: "<gold><b>Annual Win Streak Ranking</b></gold>"
+@@ -1672,26 +1702,3 @@ tournament:
+   start: "Start Tournament"
+   start-hint: "Click to start the bracket"
+   owner-only-lore: "Only the owner can configure the tournament."
+-# start-effects deposit UI (en fallback)
+-  gui.kit-save-done: "Kit saved"
+-  gui.start-effects-hint: "Put your potions here"
+-  gui.start-effects-hint-lore-1: "Drop normal/splash/lingering potions into the band above,"
+-  gui.start-effects-hint-lore-2: "then press Save — effect, level and duration are kept."
+-  gui.start-effects-save: "Save (apply effects)"
+-  gui.start-effects-clear: "Clear all"
+-  gui.start-effects-saved: "Start effects saved: <n> kind(s) / <rejected> non-potion item(s) returned"
+-  gui.trim-free-kit-bound: "Free perk: kit “<kit>” is now your full-trim slot"
+-  gui.trim-free-note-unset: "Free perk: VIP trim range on ONE kit of your choice (locks on first apply)"
+-  gui.trim-free-note-bound: "Free perk slot: VIP range only on “<kit>”"
+-  party.invite-online-label: "Available online"
+-  party.invite-sent: "Invite sent — click again to cancel"
+-  party.invite-revoke-hint: "Click: cancel the invite"
+-  gui.party-map-chip: "Change map"
+-  gui.party-map-chip-hint: "Click: pick a party map (does not start the battle)"
+-  gui.party-map-click: "Click: pick this map (back to kit select)"
+-  gui.party-start-kit: "Start battle: <kit>"
+-  gui.party-start-orig: "Start battle: my Original Kit"
+-  gui.party-selected-orig: "Selected: owner’s Original Kit (rules included)"
+-  gui.party-selected-inner: "Preset: <inner>"
+-  gui.party-pick-first: "Pick a kit first (click one)!"
+-  gui.party-select-click: "Click: select → press START to begin"
+diff --git a/src/main/resources/lang/en_us.yml b/src/main/resources/lang/en_us.yml
+index 948af09..96b7d0f 100644
+--- a/src/main/resources/lang/en_us.yml
++++ b/src/main/resources/lang/en_us.yml
+@@ -83,8 +83,8 @@ menu:
+   save: "Save"
+   apply: "Apply"
+   confirm: "Confirm"
+-  yes: "Yes"
+-  no: "No"
++  "yes": "Yes"
++  "no": "No"
+   delete: "Delete"
+ 
+ party:
+@@ -215,7 +215,6 @@ party:
+   decline-hover: "Decline this invite"
+   no-team-named: "<red>No public party named '<name>'."
+   joined: "<aqua><player> joined the party."
+-  same-ip-notice: "<yellow>A player from the same connection is waiting in this ranked queue; same-IP players never pair in ranked."
+ 
+   declined-owner: "<yellow><player> declined the invite."
+   declined-self: "<gray>Invite declined."
+@@ -310,6 +309,9 @@ party:
+   hotbar-settings: "Party Settings"
+   hotbar-settings-hint: "Owner only — rules and danger zone"
+ 
++  invite-online-label: "Available online"
++  invite-sent: "Invite sent — click again to cancel"
++  invite-revoke-hint: "Click: cancel the invite"
+ general:
+   prefix: ""
+   maintenance: "<red>Practice is currently in maintenance mode."
+@@ -323,16 +325,6 @@ general:
+   loading: "<gray>Loading, please wait..."
+   mode-ranked: "ranked"
+   mode-unranked: "unranked"
+-  kb-select: "<white>KB: <kb>"
+-  kb-default-name: "Default (default KB: <name>)"
+-  kb-off-name: "No KB change"
+-  kb-title: "KB Profile"
+-  kb-select-lore: "<gray>Click to pick from the list."
+-  kb-default-lore: "<gray>Fight with the server default KB."
+-  kb-off-lore: "<gray>Apply no profile — plain knockback rules."
+-  kb-profile-lore: "<gray>Horizontal ×<h> / Vertical ×<v>"
+-  kb-empty: "No profiles installed"
+-  kb-empty-lore: "<gray>Drop profile JSONs into plugins/n-arena/kb/."
+ 
+ 
+ duel:
+@@ -395,6 +387,16 @@ duel-gui:
+   combat-mode-lore-java: "Java: cooldown, sweep attacks."
+   combat-mode-lore-bedrock: "Bedrock: fast clicks, no cooldown."
+ 
++  kb-select: "<white>KB: <kb>"
++  kb-default-name: "Default (default KB: <name>)"
++  kb-off-name: "No KB change"
++  kb-title: "KB Profile"
++  kb-select-lore: "<gray>Click to pick from the list."
++  kb-default-lore: "<gray>Fight with the server default KB."
++  kb-off-lore: "<gray>Apply no profile — plain knockback rules."
++  kb-profile-lore: "<gray>Horizontal ×<h> / Vertical ×<v>"
++  kb-empty: "No profiles installed"
++  kb-empty-lore: "<gray>Drop profile JSONs into plugins/n-arena/kb/."
+ ffa:
+   maintenance: "<red>Practice is currently in maintenance mode."
+   unavailable: "<red>FFA is currently unavailable."
+@@ -484,6 +486,7 @@ queue:
+   kit-disabled: "<red>That kit queue is currently disabled."
+   cannot-join: "<red>You cannot join a queue right now."
+   already-queued: "<red>You are already in a queue."
++  same-ip-notice: "<yellow>A player from the same connection is waiting in this ranked queue; same-IP players never pair in ranked."
+   slow-down: "<red>Easy there — try that again in a moment."
+   high-ping: "<red>Your ping (<ping>ms) is too high for ranked (max <max>ms)."
+   ranked-locked: "<red>Ranked queue is currently locked. (<count>/<threshold> unique players joined)"
+@@ -1149,21 +1152,21 @@ gui:
+   party-danger: "Danger Settings"
+   party-danger-lore: "Transfer ownership, disband the party, reset teams."
+   update-data: "Update Data"
+-  gui.party-launch-title: "Party Battle"
+-  gui.party-launch-kit: "Select a Kit"
+-  gui.party-launch-kit-lore: "Opens the classic kit picker — the red-vs-blue battle starts on pick."
+-  gui.party-launch-mode: "Select a Battle Mode"
+-  gui.party-launch-mode-lore: "Party Fight (red vs blue) or Party FFA."
+-  gui.party-launch-mode-current: "Mode: <mode>"
+-  gui.battle-mode-fight: "Party Fight"
+-  gui.battle-mode-fight-lore: "The classic party battle: red vs blue with your kit and map."
+-  gui.battle-mode-ffa: "Party FFA"
+-  gui.battle-mode-ffa-lore: "Private FFA: the whole party fights free-for-all in its own zone."
+-  gui.party-launch-go: "Start Battle"
+-  gui.party-launch-go-fight-lore: "Starts the red-vs-blue party fight."
+-  gui.party-launch-go-ffa-lore: "Sends the whole party into the private FFA."
+-  gui.party-ffa-too-few: "<red>Party FFA needs at least 2 free members.</red>"
+-  gui.party-ffa-failed: "<red>Could not start the Party FFA.</red>"
++  party-launch-title: "Party Battle"
++  party-launch-kit: "Select a Kit"
++  party-launch-kit-lore: "Opens the classic kit picker — the red-vs-blue battle starts on pick."
++  party-launch-mode: "Select a Battle Mode"
++  party-launch-mode-lore: "Party Fight (red vs blue) or Party FFA."
++  party-launch-mode-current: "Mode: <mode>"
++  battle-mode-fight: "Party Fight"
++  battle-mode-fight-lore: "The classic party battle: red vs blue with your kit and map."
++  battle-mode-ffa: "Party FFA"
++  battle-mode-ffa-lore: "Private FFA: the whole party fights free-for-all in its own zone."
++  party-launch-go: "Start Battle"
++  party-launch-go-fight-lore: "Starts the red-vs-blue party fight."
++  party-launch-go-ffa-lore: "Sends the whole party into the private FFA."
++  party-ffa-too-few: "<red>Party FFA needs at least 2 free members.</red>"
++  party-ffa-failed: "<red>Could not start the Party FFA.</red>"
+   party-none-lore: "Use the buttons above to create one"
+   admin-hub-lore-1: "Day-to-day setup is done from this UI"
+   admin-hub-lore-2: "Commands are for emergencies and advanced settings"
+@@ -1467,6 +1470,32 @@ gui:
+   request-inbox-duel-raison: "Ranked / Unranked"
+   request-inbox-duel-hint: "Left-click to accept, right-click to deny"
+   request-inbox-generic-hint: "Left-click to accept, right-click to deny"
++  kit-save-done: "Kit saved"
++  start-effects-hint: "Put your potions here"
++  start-effects-hint-lore-1: "Drop normal/splash/lingering potions into the band above,"
++  start-effects-hint-lore-2: "then press Save — effect, level and duration are kept."
++  start-effects-save: "Save (apply effects)"
++  start-effects-clear: "Clear all"
++  start-effects-saved: "Start effects saved: <n> kind(s) / <rejected> non-potion item(s) returned"
++  trim-free-kit-bound: "Free perk: kit “<kit>” is now your full-trim slot"
++  trim-free-note-unset: "Free perk: VIP trim range on ONE kit of your choice (locks on first apply)"
++  trim-free-note-bound: "Free perk slot: VIP range only on “<kit>”"
++  party-map-chip: "Change map"
++  party-map-chip-hint: "Click: pick a party map (does not start the battle)"
++  party-map-click: "Click: pick this map (back to kit select)"
++  party-start-kit: "Start battle: <kit>"
++  party-start-orig: "Start battle: my Original Kit"
++  party-selected-orig: "Selected: owner’s Original Kit (rules included)"
++  party-selected-inner: "Preset: <inner>"
++  party-pick-first: "Pick a kit first (click one)!"
++  party-select-click: "Click: select → press START to begin"
++  kit: "Kit"
++  ranking: "Ranking"
++  percentile: "Percentile"
++  battle-mode-title: "Battle Mode"
++  party-launch-map: "Select a Map"
++  preset-removable-hint: "Players may delete this preset item"
++  preset-more-enchant-hint: "Also usable as an enchantment ingredient"
+ lb:
+   kill-title: "<gold><b>Monthly Kill Ranking</b></gold>"
+   streak-title: "<gold><b>Annual Win Streak Ranking</b></gold>"
+@@ -1674,25 +1703,3 @@ tournament:
+   start: "Start Tournament"
+   start-hint: "Click to start the bracket"
+   owner-only-lore: "Only the owner can configure the tournament."
+-  gui.kit-save-done: "Kit saved"
+-  gui.start-effects-hint: "Put your potions here"
+-  gui.start-effects-hint-lore-1: "Drop normal/splash/lingering potions into the band above,"
+-  gui.start-effects-hint-lore-2: "then press Save — effect, level and duration are kept."
+-  gui.start-effects-save: "Save (apply effects)"
+-  gui.start-effects-clear: "Clear all"
+-  gui.start-effects-saved: "Start effects saved: <n> kind(s) / <rejected> non-potion item(s) returned"
+-  gui.trim-free-kit-bound: "Free perk: kit “<kit>” is now your full-trim slot"
+-  gui.trim-free-note-unset: "Free perk: VIP trim range on ONE kit of your choice (locks on first apply)"
+-  gui.trim-free-note-bound: "Free perk slot: VIP range only on “<kit>”"
+-  party.invite-online-label: "Available online"
+-  party.invite-sent: "Invite sent — click again to cancel"
+-  party.invite-revoke-hint: "Click: cancel the invite"
+-  gui.party-map-chip: "Change map"
+-  gui.party-map-chip-hint: "Click: pick a party map (does not start the battle)"
+-  gui.party-map-click: "Click: pick this map (back to kit select)"
+-  gui.party-start-kit: "Start battle: <kit>"
+-  gui.party-start-orig: "Start battle: my Original Kit"
+-  gui.party-selected-orig: "Selected: owner’s Original Kit (rules included)"
+-  gui.party-selected-inner: "Preset: <inner>"
+-  gui.party-pick-first: "Pick a kit first (click one)!"
+-  gui.party-select-click: "Click: select → press START to begin"
+diff --git a/src/main/resources/lang/es_es.yml b/src/main/resources/lang/es_es.yml
+index e5e1dc8..4160513 100644
+--- a/src/main/resources/lang/es_es.yml
++++ b/src/main/resources/lang/es_es.yml
+@@ -81,8 +81,8 @@ menu:
+   save: "Guardar"
+   apply: "Aplicar"
+   confirm: "Confirmar"
+-  yes: "Sí"
+-  no: "No"
++  "yes": "Sí"
++  "no": "No"
+   delete: "Eliminar"
+ 
+ party:
+@@ -213,7 +213,6 @@ party:
+   decline-hover: "Rechazar esta invitación"
+   no-team-named: "<red>No hay ningún equipo público llamado '<name>'."
+   joined: "<aqua><player> se ha unido al equipo."
+-  same-ip-notice: "<yellow>Un jugador con la misma conexión está esperando en esta cola clasificatoria; los jugadores con la misma IP nunca se emparejan en clasificatoria."
+ 
+   declined-owner: "<yellow><player> rechazó la invitación."
+   declined-self: "<gray>Invitación rechazada."
+@@ -308,6 +307,9 @@ party:
+   hotbar-settings: "Ajustes del grupo"
+   hotbar-settings-hint: "Solo el dueño: reglas y zona peligrosa"
+ 
++  invite-online-label: "Available online"
++  invite-sent: "Invite sent — click again to cancel"
++  invite-revoke-hint: "Click: cancel the invite"
+ general:
+   prefix: ""
+   maintenance: "<red>La práctica está en mantenimiento."
+@@ -321,16 +323,6 @@ general:
+   loading: "<gray>Cargando, por favor espera..."
+   mode-ranked: "ranked"
+   mode-unranked: "unranked"
+-  kb-select: "<white>KB: <kb>"
+-  kb-default-name: "Predeterminado (KB por defecto: <name>)"
+-  kb-off-name: "Sin cambio de KB"
+-  kb-title: "Elegir perfil de KB"
+-  kb-select-lore: "<gray>Haz clic para elegir de la lista."
+-  kb-default-lore: "<gray>Pelea con el KB predeterminado del servidor."
+-  kb-off-lore: "<gray>No aplica ningún perfil (knockback estándar)."
+-  kb-profile-lore: "<gray>Horizontal ×<h> / Vertical ×<v>"
+-  kb-empty: "No hay perfiles instalados"
+-  kb-empty-lore: "<gray>Añade JSON en plugins/n-arena/kb/."
+ 
+ 
+ duel:
+@@ -393,6 +385,16 @@ duel-gui:
+   combat-mode-lore-java: "Java: cooldown, sweep attacks."
+   combat-mode-lore-bedrock: "Bedrock: fast clicks, no cooldown."
+ 
++  kb-select: "<white>KB: <kb>"
++  kb-default-name: "Predeterminado (KB por defecto: <name>)"
++  kb-off-name: "Sin cambio de KB"
++  kb-title: "Elegir perfil de KB"
++  kb-select-lore: "<gray>Haz clic para elegir de la lista."
++  kb-default-lore: "<gray>Pelea con el KB predeterminado del servidor."
++  kb-off-lore: "<gray>No aplica ningún perfil (knockback estándar)."
++  kb-profile-lore: "<gray>Horizontal ×<h> / Vertical ×<v>"
++  kb-empty: "No hay perfiles instalados"
++  kb-empty-lore: "<gray>Añade JSON en plugins/n-arena/kb/."
+ ffa:
+   maintenance: "<red>La práctica está en mantenimiento."
+   unavailable: "<red>El FFA no está disponible ahora."
+@@ -482,6 +484,7 @@ queue:
+   kit-disabled: "<red>La cola de ese kit está desactivada."
+   cannot-join: "<red>No puedes unirte a una cola ahora."
+   already-queued: "<red>Ya estás en una cola."
++  same-ip-notice: "<yellow>Un jugador con la misma conexión está esperando en esta cola clasificatoria; los jugadores con la misma IP nunca se emparejan en clasificatoria."
+   slow-down: "<red>Tranquilo — inténtalo de nuevo en un momento."
+   high-ping: "<red>Tu ping (<ping>ms) es demasiado alto para ranked (máx <max>ms)."
+   ranked-locked: "<red>La cola ranked está bloqueada. (<count>/<threshold> jugadores únicos conectados)"
+@@ -1147,21 +1150,21 @@ gui:
+   party-danger: "Ajustes de peligro"
+   party-danger-lore: "Transferir propiedad, disolver el grupo, restablecer equipos."
+   update-data: "Actualizar datos"
+-  gui.party-launch-title: "Batalla de grupo"
+-  gui.party-launch-kit: "Elegir kit"
+-  gui.party-launch-kit-lore: "Abre el selector de kits: la batalla rojo vs azul empieza al elegir."
+-  gui.party-launch-mode: "Elegir modo de batalla"
+-  gui.party-launch-mode-lore: "Party Fight (rojo vs azul) o Party FFA."
+-  gui.party-launch-mode-current: "Modo: <mode>"
+-  gui.battle-mode-fight: "Party Fight"
+-  gui.battle-mode-fight-lore: "La batalla de grupo clásica: rojo vs azul con tu kit y mapa."
+-  gui.battle-mode-ffa: "Party FFA"
+-  gui.battle-mode-ffa-lore: "FFA privada: todo el grupo pelea libre en su propia zona."
+-  gui.party-launch-go: "Comenzar batalla"
+-  gui.party-launch-go-fight-lore: "Inicia la batalla de grupo rojo vs azul."
+-  gui.party-launch-go-ffa-lore: "Envía a todo el grupo a la FFA privada."
+-  gui.party-ffa-too-few: "<red>La Party FFA necesita al menos 2 miembros libres.</red>"
+-  gui.party-ffa-failed: "<red>No se pudo iniciar la Party FFA.</red>"
++  party-launch-title: "Batalla de grupo"
++  party-launch-kit: "Elegir kit"
++  party-launch-kit-lore: "Abre el selector de kits: la batalla rojo vs azul empieza al elegir."
++  party-launch-mode: "Elegir modo de batalla"
++  party-launch-mode-lore: "Party Fight (rojo vs azul) o Party FFA."
++  party-launch-mode-current: "Modo: <mode>"
++  battle-mode-fight: "Party Fight"
++  battle-mode-fight-lore: "La batalla de grupo clásica: rojo vs azul con tu kit y mapa."
++  battle-mode-ffa: "Party FFA"
++  battle-mode-ffa-lore: "FFA privada: todo el grupo pelea libre en su propia zona."
++  party-launch-go: "Comenzar batalla"
++  party-launch-go-fight-lore: "Inicia la batalla de grupo rojo vs azul."
++  party-launch-go-ffa-lore: "Envía a todo el grupo a la FFA privada."
++  party-ffa-too-few: "<red>La Party FFA necesita al menos 2 miembros libres.</red>"
++  party-ffa-failed: "<red>No se pudo iniciar la Party FFA.</red>"
+   party-none-lore: "Usa los botones de arriba para crear uno"
+   admin-hub-lore-1: "La configuración diaria se hace desde esta interfaz"
+   admin-hub-lore-2: "Los comandos son para emergencias y ajustes avanzados"
+@@ -1465,6 +1468,33 @@ gui:
+   request-inbox-duel-raison: "Clasificatoria / Normal"
+   request-inbox-duel-hint: "Clic izquierdo acepta, clic derecho rechaza"
+   request-inbox-generic-hint: "Clic izquierdo acepta, clic derecho rechaza"
++# start-effects deposit UI (en fallback)
++  kit-save-done: "Kit saved"
++  start-effects-hint: "Put your potions here"
++  start-effects-hint-lore-1: "Drop normal/splash/lingering potions into the band above,"
++  start-effects-hint-lore-2: "then press Save — effect, level and duration are kept."
++  start-effects-save: "Save (apply effects)"
++  start-effects-clear: "Clear all"
++  start-effects-saved: "Start effects saved: <n> kind(s) / <rejected> non-potion item(s) returned"
++  trim-free-kit-bound: "Free perk: kit “<kit>” is now your full-trim slot"
++  trim-free-note-unset: "Free perk: VIP trim range on ONE kit of your choice (locks on first apply)"
++  trim-free-note-bound: "Free perk slot: VIP range only on “<kit>”"
++  party-map-chip: "Change map"
++  party-map-chip-hint: "Click: pick a party map (does not start the battle)"
++  party-map-click: "Click: pick this map (back to kit select)"
++  party-start-kit: "Start battle: <kit>"
++  party-start-orig: "Start battle: my Original Kit"
++  party-selected-orig: "Selected: owner’s Original Kit (rules included)"
++  party-selected-inner: "Preset: <inner>"
++  party-pick-first: "Pick a kit first (click one)!"
++  party-select-click: "Click: select → press START to begin"
++  kit: "Kit"
++  ranking: "Clasificación"
++  percentile: "Percentil"
++  battle-mode-title: "Modo de batalla"
++  party-launch-map: "Elegir mapa"
++  preset-removable-hint: "Los jugadores pueden borrar este objeto"
++  preset-more-enchant-hint: "También sirve para encantar otros objetos"
+ lb:
+   kill-title: "<gold><b>Ranking mensual de bajas</b></gold>"
+   streak-title: "<gold><b>Ranking anual de rachas</b></gold>"
+@@ -1672,26 +1702,3 @@ tournament:
+   start: "Iniciar torneo"
+   start-hint: "Clic para iniciar las eliminatorias"
+   owner-only-lore: "Solo el líder puede configurar el torneo."
+-# start-effects deposit UI (en fallback)
+-  gui.kit-save-done: "Kit saved"
+-  gui.start-effects-hint: "Put your potions here"
+-  gui.start-effects-hint-lore-1: "Drop normal/splash/lingering potions into the band above,"
+-  gui.start-effects-hint-lore-2: "then press Save — effect, level and duration are kept."
+-  gui.start-effects-save: "Save (apply effects)"
+-  gui.start-effects-clear: "Clear all"
+-  gui.start-effects-saved: "Start effects saved: <n> kind(s) / <rejected> non-potion item(s) returned"
+-  gui.trim-free-kit-bound: "Free perk: kit “<kit>” is now your full-trim slot"
+-  gui.trim-free-note-unset: "Free perk: VIP trim range on ONE kit of your choice (locks on first apply)"
+-  gui.trim-free-note-bound: "Free perk slot: VIP range only on “<kit>”"
+-  party.invite-online-label: "Available online"
+-  party.invite-sent: "Invite sent — click again to cancel"
+-  party.invite-revoke-hint: "Click: cancel the invite"
+-  gui.party-map-chip: "Change map"
+-  gui.party-map-chip-hint: "Click: pick a party map (does not start the battle)"
+-  gui.party-map-click: "Click: pick this map (back to kit select)"
+-  gui.party-start-kit: "Start battle: <kit>"
+-  gui.party-start-orig: "Start battle: my Original Kit"
+-  gui.party-selected-orig: "Selected: owner’s Original Kit (rules included)"
+-  gui.party-selected-inner: "Preset: <inner>"
+-  gui.party-pick-first: "Pick a kit first (click one)!"
+-  gui.party-select-click: "Click: select → press START to begin"
+diff --git a/src/main/resources/lang/fr_fr.yml b/src/main/resources/lang/fr_fr.yml
+index 0d1deac..3e0298f 100644
+--- a/src/main/resources/lang/fr_fr.yml
++++ b/src/main/resources/lang/fr_fr.yml
+@@ -81,8 +81,8 @@ menu:
+   save: "Enregistrer"
+   apply: "Appliquer"
+   confirm: "Confirmer"
+-  yes: "Oui"
+-  no: "Non"
++  "yes": "Oui"
++  "no": "Non"
+   delete: "Supprimer"
+ 
+ party:
+@@ -213,7 +213,6 @@ party:
+   decline-hover: "Refuser cette invitation"
+   no-team-named: "<red>Aucune équipe publique nommée '<name>'."
+   joined: "<aqua><player> a rejoint l'équipe."
+-  same-ip-notice: "<yellow>Un joueur depuis la même connexion attend dans cette file classée ; les joueurs partageant une IP ne sont jamais appariés en classé."
+ 
+   declined-owner: "<yellow><player> a refusé l'invitation."
+   declined-self: "<gray>Invitation refusée."
+@@ -308,6 +307,9 @@ party:
+   hotbar-settings: "Paramètres du groupe"
+   hotbar-settings-hint: "Propriétaire seulement — règles et zone dangereuse"
+ 
++  invite-online-label: "Available online"
++  invite-sent: "Invite sent — click again to cancel"
++  invite-revoke-hint: "Click: cancel the invite"
+ general:
+   prefix: ""
+   maintenance: "<red>L'entraînement est en maintenance."
+@@ -321,16 +323,6 @@ general:
+   loading: "<gray>Chargement, patiente..."
+   mode-ranked: "ranked"
+   mode-unranked: "unranked"
+-  kb-select: "<white>KB : <kb>"
+-  kb-default-name: "Par défaut (KB par défaut : <name>)"
+-  kb-off-name: "Aucun changement de KB"
+-  kb-title: "Choix du profil KB"
+-  kb-select-lore: "<gray>Cliquez pour choisir dans la liste."
+-  kb-default-lore: "<gray>Combat avec le KB par défaut du serveur."
+-  kb-off-lore: "<gray>Aucun profil appliqué — knockback standard."
+-  kb-profile-lore: "<gray>Horizontal ×<h> / Vertical ×<v>"
+-  kb-empty: "Aucun profil installé"
+-  kb-empty-lore: "<gray>Déposez des JSON dans plugins/n-arena/kb/."
+ 
+ 
+ duel:
+@@ -393,6 +385,16 @@ duel-gui:
+   combat-mode-lore-java: "Java: cooldown, sweep attacks."
+   combat-mode-lore-bedrock: "Bedrock: fast clicks, no cooldown."
+ 
++  kb-select: "<white>KB : <kb>"
++  kb-default-name: "Par défaut (KB par défaut : <name>)"
++  kb-off-name: "Aucun changement de KB"
++  kb-title: "Choix du profil KB"
++  kb-select-lore: "<gray>Cliquez pour choisir dans la liste."
++  kb-default-lore: "<gray>Combat avec le KB par défaut du serveur."
++  kb-off-lore: "<gray>Aucun profil appliqué — knockback standard."
++  kb-profile-lore: "<gray>Horizontal ×<h> / Vertical ×<v>"
++  kb-empty: "Aucun profil installé"
++  kb-empty-lore: "<gray>Déposez des JSON dans plugins/n-arena/kb/."
+ ffa:
+   maintenance: "<red>Le practice est en maintenance."
+   unavailable: "<red>Le FFA est actuellement indisponible."
+@@ -482,6 +484,7 @@ queue:
+   kit-disabled: "<red>La file de ce kit est désactivée."
+   cannot-join: "<red>Tu ne peux pas rejoindre une file maintenant."
+   already-queued: "<red>Tu es déjà dans une file."
++  same-ip-notice: "<yellow>Un joueur depuis la même connexion attend dans cette file classée ; les joueurs partageant une IP ne sont jamais appariés en classé."
+   slow-down: "<red>Doucement — réessayez dans un instant."
+   high-ping: "<red>Ton ping (<ping>ms) est trop élevé pour le ranked (max <max>ms)."
+   ranked-locked: "<red>La file ranked est verrouillée. (<count>/<threshold> joueurs uniques connectés)"
+@@ -1147,21 +1150,21 @@ gui:
+   party-danger: "Actions dangereuses"
+   party-danger-lore: "Transfert de propriétaire, dissolution, réinitialisation des équipes."
+   update-data: "Actualiser"
+-  gui.party-launch-title: "Combat de groupe"
+-  gui.party-launch-kit: "Choisir un kit"
+-  gui.party-launch-kit-lore: "Ouvre le sélecteur de kits — le combat rouge vs bleu démarre au choix."
+-  gui.party-launch-mode: "Choisir le mode"
+-  gui.party-launch-mode-lore: "Party Fight (rouge vs bleu) ou Party FFA."
+-  gui.party-launch-mode-current: "Mode : <mode>"
+-  gui.battle-mode-fight: "Party Fight"
+-  gui.battle-mode-fight-lore: "Le combat de groupe classique : rouge vs bleu avec kit et carte."
+-  gui.battle-mode-ffa: "Party FFA"
+-  gui.battle-mode-ffa-lore: "FFA privée : tout le groupe s’affronte dans sa propre zone."
+-  gui.party-launch-go: "Lancer le combat"
+-  gui.party-launch-go-fight-lore: "Lance le combat de groupe rouge vs bleu."
+-  gui.party-launch-go-ffa-lore: "Envoie tout le groupe en FFA privée."
+-  gui.party-ffa-too-few: "<red>La Party FFA nécessite au moins 2 membres libres.</red>"
+-  gui.party-ffa-failed: "<red>Impossible de lancer la Party FFA.</red>"
++  party-launch-title: "Combat de groupe"
++  party-launch-kit: "Choisir un kit"
++  party-launch-kit-lore: "Ouvre le sélecteur de kits — le combat rouge vs bleu démarre au choix."
++  party-launch-mode: "Choisir le mode"
++  party-launch-mode-lore: "Party Fight (rouge vs bleu) ou Party FFA."
++  party-launch-mode-current: "Mode : <mode>"
++  battle-mode-fight: "Party Fight"
++  battle-mode-fight-lore: "Le combat de groupe classique : rouge vs bleu avec kit et carte."
++  battle-mode-ffa: "Party FFA"
++  battle-mode-ffa-lore: "FFA privée : tout le groupe s’affronte dans sa propre zone."
++  party-launch-go: "Lancer le combat"
++  party-launch-go-fight-lore: "Lance le combat de groupe rouge vs bleu."
++  party-launch-go-ffa-lore: "Envoie tout le groupe en FFA privée."
++  party-ffa-too-few: "<red>La Party FFA nécessite au moins 2 membres libres.</red>"
++  party-ffa-failed: "<red>Impossible de lancer la Party FFA.</red>"
+   party-none-lore: "Utilise les boutons ci-dessus pour en créer une"
+   admin-hub-lore-1: "La configuration quotidienne se fait depuis cette interface"
+   admin-hub-lore-2: "Les commandes servent aux urgences et réglages avancés"
+@@ -1465,6 +1468,33 @@ gui:
+   request-inbox-duel-raison: "Classe / Normal"
+   request-inbox-duel-hint: "Clic gauche pour accepter, clic droit pour refuser"
+   request-inbox-generic-hint: "Clic gauche pour accepter, clic droit pour refuser"
++# start-effects deposit UI (en fallback)
++  kit-save-done: "Kit saved"
++  start-effects-hint: "Put your potions here"
++  start-effects-hint-lore-1: "Drop normal/splash/lingering potions into the band above,"
++  start-effects-hint-lore-2: "then press Save — effect, level and duration are kept."
++  start-effects-save: "Save (apply effects)"
++  start-effects-clear: "Clear all"
++  start-effects-saved: "Start effects saved: <n> kind(s) / <rejected> non-potion item(s) returned"
++  trim-free-kit-bound: "Free perk: kit “<kit>” is now your full-trim slot"
++  trim-free-note-unset: "Free perk: VIP trim range on ONE kit of your choice (locks on first apply)"
++  trim-free-note-bound: "Free perk slot: VIP range only on “<kit>”"
++  party-map-chip: "Change map"
++  party-map-chip-hint: "Click: pick a party map (does not start the battle)"
++  party-map-click: "Click: pick this map (back to kit select)"
++  party-start-kit: "Start battle: <kit>"
++  party-start-orig: "Start battle: my Original Kit"
++  party-selected-orig: "Selected: owner’s Original Kit (rules included)"
++  party-selected-inner: "Preset: <inner>"
++  party-pick-first: "Pick a kit first (click one)!"
++  party-select-click: "Click: select → press START to begin"
++  kit: "Kit"
++  ranking: "Classement"
++  percentile: "Percentile"
++  battle-mode-title: "Mode de combat"
++  party-launch-map: "Choisir une carte"
++  preset-removable-hint: "Les joueurs peuvent supprimer cet objet"
++  preset-more-enchant-hint: "Sert aussi d'ingrédient d'enchantement"
+ lb:
+   kill-title: "<gold><b>Classement mensuel des éliminations</b></gold>"
+   streak-title: "<gold><b>Classement annuel des séries</b></gold>"
+@@ -1672,26 +1702,3 @@ tournament:
+   start: "Lancer le tournoi"
+   start-hint: "Cliquez pour lancer le tableau"
+   owner-only-lore: "Seul le chef peut configurer le tournoi."
+-# start-effects deposit UI (en fallback)
+-  gui.kit-save-done: "Kit saved"
+-  gui.start-effects-hint: "Put your potions here"
+-  gui.start-effects-hint-lore-1: "Drop normal/splash/lingering potions into the band above,"
+-  gui.start-effects-hint-lore-2: "then press Save — effect, level and duration are kept."
+-  gui.start-effects-save: "Save (apply effects)"
+-  gui.start-effects-clear: "Clear all"
+-  gui.start-effects-saved: "Start effects saved: <n> kind(s) / <rejected> non-potion item(s) returned"
+-  gui.trim-free-kit-bound: "Free perk: kit “<kit>” is now your full-trim slot"
+-  gui.trim-free-note-unset: "Free perk: VIP trim range on ONE kit of your choice (locks on first apply)"
+-  gui.trim-free-note-bound: "Free perk slot: VIP range only on “<kit>”"
+-  party.invite-online-label: "Available online"
+-  party.invite-sent: "Invite sent — click again to cancel"
+-  party.invite-revoke-hint: "Click: cancel the invite"
+-  gui.party-map-chip: "Change map"
+-  gui.party-map-chip-hint: "Click: pick a party map (does not start the battle)"
+-  gui.party-map-click: "Click: pick this map (back to kit select)"
+-  gui.party-start-kit: "Start battle: <kit>"
+-  gui.party-start-orig: "Start battle: my Original Kit"
+-  gui.party-selected-orig: "Selected: owner’s Original Kit (rules included)"
+-  gui.party-selected-inner: "Preset: <inner>"
+-  gui.party-pick-first: "Pick a kit first (click one)!"
+-  gui.party-select-click: "Click: select → press START to begin"
+diff --git a/src/main/resources/lang/ja_jp.yml b/src/main/resources/lang/ja_jp.yml
+index de3785f..d307557 100644
+--- a/src/main/resources/lang/ja_jp.yml
++++ b/src/main/resources/lang/ja_jp.yml
+@@ -82,8 +82,8 @@ menu:
+   save: "保存"
+   apply: "適用"
+   confirm: "確認"
+-  yes: "はい"
+-  no: "いいえ"
++  "yes": "はい"
++  "no": "いいえ"
+   delete: "削除"
+ 
+ party:
+@@ -214,7 +214,6 @@ party:
+   decline-hover: "この招待を拒否"
+   no-team-named: "<red>「<name>」という公開パーティはありません。"
+   joined: "<aqua><player> がパーティに参加しました。"
+-  same-ip-notice: "<yellow>同じ接続元のプレイヤーがこのランクキューに待機中です。同一IP同士はランク戦でマッチしません。"
+ 
+   declined-owner: "<yellow><player> が招待を拒否しました。"
+   declined-self: "<gray>招待を拒否しました。"
+@@ -309,6 +308,9 @@ party:
+   hotbar-settings: "パーティ設定"
+   hotbar-settings-hint: "オーナー専用 — ルールと危険操作"
+ 
++  invite-online-label: "候補人数"
++  invite-sent: "招待送信済み — もう一度クリックで取り消し"
++  invite-revoke-hint: "クリック: 招待を取り消す"
+ general:
+   prefix: ""
+   maintenance: "<red>現在メンテナンス中です。"
+@@ -322,16 +324,6 @@ general:
+   loading: "<gray>読み込み中です、しばらくお待ちください..."
+   mode-ranked: "ランク戦"
+   mode-unranked: "アンランク戦"
+-  kb-select: "<white>KB: <kb>"
+-  kb-default-name: "既定 (デフォルト: <name>)"
+-  kb-off-name: "KBの変更無し"
+-  kb-title: "KBプロファイル選択"
+-  kb-select-lore: "<gray>クリックで一覧から選択します。"
+-  kb-default-lore: "<gray>サーバー既定のKBで戦います。"
+-  kb-off-lore: "<gray>プロファイルを適用しません（バニラのまま）。"
+-  kb-profile-lore: "<gray>水平 ×<h> / 垂直 ×<v>"
+-  kb-empty: "プロファイルがありません"
+-  kb-empty-lore: "<gray>plugins/n-arena/kb/ にJSONを置くと追加できます。"
+ 
+ 
+ duel:
+@@ -394,6 +386,16 @@ duel-gui:
+   combat-mode-lore-java: "Java: クールダウンあり、スイープ攻撃"
+   combat-mode-lore-bedrock: "Bedrock: 連打可能、クールダウンなし"
+ 
++  kb-select: "<white>KB: <kb>"
++  kb-default-name: "既定 (デフォルト: <name>)"
++  kb-off-name: "KBの変更無し"
++  kb-title: "KBプロファイル選択"
++  kb-select-lore: "<gray>クリックで一覧から選択します。"
++  kb-default-lore: "<gray>サーバー既定のKBで戦います。"
++  kb-off-lore: "<gray>プロファイルを適用しません（バニラのまま）。"
++  kb-profile-lore: "<gray>水平 ×<h> / 垂直 ×<v>"
++  kb-empty: "プロファイルがありません"
++  kb-empty-lore: "<gray>plugins/n-arena/kb/ にJSONを置くと追加できます。"
+ ffa:
+   maintenance: "<red>現在メンテナンス中です。"
+   unavailable: "<red>FFAは現在利用できません。"
+@@ -483,6 +485,7 @@ queue:
+   kit-disabled: "<red>そのキットのキューは現在無効です。"
+   cannot-join: "<red>今はキューに参加できません。"
+   already-queued: "<red>すでにキューに入っています。"
++  same-ip-notice: "<yellow>同じ接続元のプレイヤーがこのランクキューに待機中です。同一IP同士はランク戦でマッチしません。"
+   slow-down: "<red>少し間をおいてからもう一度お試しください。"
+   high-ping: "<red>あなたのPing（<ping>ms）が高すぎるためランク戦に参加できません（上限 <max>ms）。"
+   ranked-locked: "<red>ランク戦キューは現在ロックされています。（<count>/<threshold>人のユニークプレイヤーが参加済み）"
+@@ -1148,21 +1151,21 @@ gui:
+   party-danger: "危険な操作"
+   party-danger-lore: "オーナー譲渡・パーティ解散・チーム割り当てリセット。"
+   update-data: "情報を更新"
+-  gui.party-launch-title: "パーティーバトル"
+-  gui.party-launch-kit: "キットを選択"
+-  gui.party-launch-kit-lore: "クリックでキット選択を開きます（選択で赤vs青の戦闘が始まります）。"
+-  gui.party-launch-mode: "バトルモードを選択"
+-  gui.party-launch-mode-lore: "Party Fight（赤vs青）または Party FFA。"
+-  gui.party-launch-mode-current: "モード: <mode>"
+-  gui.battle-mode-fight: "Party Fight"
+-  gui.battle-mode-fight-lore: "従来どおりのパーティーバトル。キットとマップを選んで赤vs青で戦います。"
+-  gui.battle-mode-ffa: "Party FFA"
+-  gui.battle-mode-ffa-lore: "プライベートFFA。パーティー専用ゾーンで全員がバトルロイヤル。"
+-  gui.party-launch-go: "戦闘を開始"
+-  gui.party-launch-go-fight-lore: "赤vs青のパーティーバトルを開始します。"
+-  gui.party-launch-go-ffa-lore: "パーティー全員をプライベートFFAへ送ります。"
+-  gui.party-ffa-too-few: "<red>Party FFAには空いているメンバーが2人以上必要です。</red>"
+-  gui.party-ffa-failed: "<red>Party FFAを開始できませんでした。</red>"
++  party-launch-title: "パーティーバトル"
++  party-launch-kit: "キットを選択"
++  party-launch-kit-lore: "クリックでキット選択を開きます（選択で赤vs青の戦闘が始まります）。"
++  party-launch-mode: "バトルモードを選択"
++  party-launch-mode-lore: "Party Fight（赤vs青）または Party FFA。"
++  party-launch-mode-current: "モード: <mode>"
++  battle-mode-fight: "Party Fight"
++  battle-mode-fight-lore: "従来どおりのパーティーバトル。キットとマップを選んで赤vs青で戦います。"
++  battle-mode-ffa: "Party FFA"
++  battle-mode-ffa-lore: "プライベートFFA。パーティー専用ゾーンで全員がバトルロイヤル。"
++  party-launch-go: "戦闘を開始"
++  party-launch-go-fight-lore: "赤vs青のパーティーバトルを開始します。"
++  party-launch-go-ffa-lore: "パーティー全員をプライベートFFAへ送ります。"
++  party-ffa-too-few: "<red>Party FFAには空いているメンバーが2人以上必要です。</red>"
++  party-ffa-failed: "<red>Party FFAを開始できませんでした。</red>"
+   party-none-lore: "上のボタンから作成できる"
+   admin-hub-lore-1: "基本操作はここから UI で完結"
+   admin-hub-lore-2: "コマンドは緊急・高度設定用"
+@@ -1466,6 +1469,32 @@ gui:
+   request-inbox-duel-raison: "ランク / アンランク"
+   request-inbox-duel-hint: "左クリックで承認・右クリックで拒否"
+   request-inbox-generic-hint: "左クリックで承認・右クリックで拒否"
++  kit-save-done: "キットを保存しました"
++  start-effects-hint: "ポーションをここに入れてください"
++  start-effects-hint-lore-1: "クリエのポーション/スプラッシュ/残留ポーションを"
++  start-effects-hint-lore-2: "そのまま上の欄に入れて Save を押すだけ。効果・強さ・時間が保存されます"
++  start-effects-save: "Save(効果を確定)"
++  start-effects-clear: "全部クリア"
++  start-effects-saved: "開始エフェクトを保存しました: <n> 種 / 非対象アイテム <rejected> 個を返却"
++  trim-free-kit-bound: "無料特典: キット《<kit>》が鍛冶型フル解放の対象に決まりました"
++  trim-free-note-unset: "無料特典: 好きな1キットのVIP範囲が使えます(初回適用で確定)"
++  trim-free-note-bound: "無料特典枠: 《<kit>》のみVIP範囲OK"
++  party-map-chip: "マップを変える"
++  party-map-chip-hint: "クリック: パーティ用マップの選択へ(開始はしません)"
++  party-map-click: "クリック: このマップに決定(キット選択に戻る)"
++  party-start-kit: "バトル開始: <kit>"
++  party-start-orig: "バトル開始: 自分の Original Kit"
++  party-selected-orig: "選択中: Owner の Original Kit(ルールも一式そのまま)"
++  party-selected-inner: "中キット: <inner>"
++  party-pick-first: "まずはキットを選んで(クリック)!"
++  party-select-click: "クリック: 選択 → START で開始"
++  kit: "キット"
++  ranking: "ランキング"
++  percentile: "パーセンタイル"
++  battle-mode-title: "バトルモード"
++  party-launch-map: "マップを選択"
++  preset-removable-hint: "プレイヤーがこの項目を削除できるようにする"
++  preset-more-enchant-hint: "エンチャントの素材としても使えるようにする"
+ lb:
+   kill-title: "<gold><b>月間キルランキング</b></gold>"
+   streak-title: "<gold><b>年間最大連勝ランキング</b></gold>"
+@@ -1673,25 +1702,3 @@ tournament:
+   start: "トーナメント開始"
+   start-hint: "クリックでブラケットを開始する"
+   owner-only-lore: "トーナメントを設定できるのはオーナーだけです。"
+-  gui.kit-save-done: "キットを保存しました"
+-  gui.start-effects-hint: "ポーションをここに入れてください"
+-  gui.start-effects-hint-lore-1: "クリエのポーション/スプラッシュ/残留ポーションを"
+-  gui.start-effects-hint-lore-2: "そのまま上の欄に入れて Save を押すだけ。効果・強さ・時間が保存されます"
+-  gui.start-effects-save: "Save(効果を確定)"
+-  gui.start-effects-clear: "全部クリア"
+-  gui.start-effects-saved: "開始エフェクトを保存しました: <n> 種 / 非対象アイテム <rejected> 個を返却"
+-  gui.trim-free-kit-bound: "無料特典: キット《<kit>》が鍛冶型フル解放の対象に決まりました"
+-  gui.trim-free-note-unset: "無料特典: 好きな1キットのVIP範囲が使えます(初回適用で確定)"
+-  gui.trim-free-note-bound: "無料特典枠: 《<kit>》のみVIP範囲OK"
+-  party.invite-online-label: "候補人数"
+-  party.invite-sent: "招待送信済み — もう一度クリックで取り消し"
+-  party.invite-revoke-hint: "クリック: 招待を取り消す"
+-  gui.party-map-chip: "マップを変える"
+-  gui.party-map-chip-hint: "クリック: パーティ用マップの選択へ(開始はしません)"
+-  gui.party-map-click: "クリック: このマップに決定(キット選択に戻る)"
+-  gui.party-start-kit: "バトル開始: <kit>"
+-  gui.party-start-orig: "バトル開始: 自分の Original Kit"
+-  gui.party-selected-orig: "選択中: Owner の Original Kit(ルールも一式そのまま)"
+-  gui.party-selected-inner: "中キット: <inner>"
+-  gui.party-pick-first: "まずはキットを選んで(クリック)!"
+-  gui.party-select-click: "クリック: 選択 → START で開始"
+diff --git a/src/main/resources/lang/ko_kr.yml b/src/main/resources/lang/ko_kr.yml
+index 0e8a749..a3f4676 100644
+--- a/src/main/resources/lang/ko_kr.yml
++++ b/src/main/resources/lang/ko_kr.yml
+@@ -81,8 +81,8 @@ menu:
+   save: "저장"
+   apply: "적용"
+   confirm: "확인"
+-  yes: "예"
+-  no: "아니요"
++  "yes": "예"
++  "no": "아니요"
+   delete: "삭제"
+ 
+ party:
+@@ -213,7 +213,6 @@ party:
+   decline-hover: "이 초대를 거절"
+   no-team-named: "<red>이름이 '<name>'인 공개 파티가 없습니다."
+   joined: "<aqua><player> 님이 파티에 참가했습니다."
+-  same-ip-notice: "<yellow>같은 접속에서 온 플레이어가 이 랭크 큐에서 대기 중입니다. 동일 IP끼리는 랭크전에서 매칭되지 않습니다."
+ 
+   declined-owner: "<yellow><player> 님이 초대를 거절했습니다."
+   declined-self: "<gray>초대를 거절했습니다."
+@@ -308,6 +307,9 @@ party:
+   hotbar-settings: "파티 설정"
+   hotbar-settings-hint: "소유자 전용 — 규칙과 위험 설정"
+ 
++  invite-online-label: "Available online"
++  invite-sent: "Invite sent — click again to cancel"
++  invite-revoke-hint: "Click: cancel the invite"
+ general:
+   prefix: ""
+   maintenance: "<red>현재 점검 중입니다."
+@@ -321,16 +323,6 @@ general:
+   loading: "<gray>로딩 중입니다. 잠시 기다려 주세요..."
+   mode-ranked: "랭크전"
+   mode-unranked: "비랭크전"
+-  kb-select: "<white>KB: <kb>"
+-  kb-default-name: "기본값 (기본 KB: <name>)"
+-  kb-off-name: "KB 변경 없음"
+-  kb-title: "KB 프로필 선택"
+-  kb-select-lore: "<gray>클릭하여 목록에서 선택하세요."
+-  kb-default-lore: "<gray>서버 기본 KB로 싸웁니다."
+-  kb-off-lore: "<gray>프로필을 적용하지 않습니다 (바닐라 그대로)."
+-  kb-profile-lore: "<gray>수평 ×<h> / 수직 ×<v>"
+-  kb-empty: "프로필이 없습니다"
+-  kb-empty-lore: "<gray>plugins/n-arena/kb/에 JSON을 넣으면 추가됩니다."
+ 
+ 
+ duel:
+@@ -393,6 +385,16 @@ duel-gui:
+   combat-mode-lore-java: "Java: cooldown, sweep attacks."
+   combat-mode-lore-bedrock: "Bedrock: fast clicks, no cooldown."
+ 
++  kb-select: "<white>KB: <kb>"
++  kb-default-name: "기본값 (기본 KB: <name>)"
++  kb-off-name: "KB 변경 없음"
++  kb-title: "KB 프로필 선택"
++  kb-select-lore: "<gray>클릭하여 목록에서 선택하세요."
++  kb-default-lore: "<gray>서버 기본 KB로 싸웁니다."
++  kb-off-lore: "<gray>프로필을 적용하지 않습니다 (바닐라 그대로)."
++  kb-profile-lore: "<gray>수평 ×<h> / 수직 ×<v>"
++  kb-empty: "프로필이 없습니다"
++  kb-empty-lore: "<gray>plugins/n-arena/kb/에 JSON을 넣으면 추가됩니다."
+ ffa:
+   maintenance: "<red>현재 점검 중입니다."
+   unavailable: "<red>FFA를 현재 이용할 수 없습니다."
+@@ -482,6 +484,7 @@ queue:
+   kit-disabled: "<red>해당 키트 대기열이 비활성화되어 있습니다."
+   cannot-join: "<red>지금은 대기열에 참여할 수 없습니다."
+   already-queued: "<red>이미 대기열에 있습니다."
++  same-ip-notice: "<yellow>같은 접속에서 온 플레이어가 이 랭크 큐에서 대기 중입니다. 동일 IP끼리는 랭크전에서 매칭되지 않습니다."
+   slow-down: "<red>너무 빠릅니다 — 잠시 후 다시 시도하세요."
+   high-ping: "<red>핑(<ping>ms)이 너무 높아 랭크에 참여할 수 없습니다 (최대 <max>ms)."
+   ranked-locked: "<red>랭크 큐가 잠겨 있습니다. (<count>/<threshold>명의 고유 플레이어가 참여)"
+@@ -1147,21 +1150,21 @@ gui:
+   party-danger: "위험한 작업"
+   party-danger-lore: "소유자 이양, 파티 해산, 팀 배정 초기화."
+   update-data: "새로고침"
+-  gui.party-launch-title: "파티 배틀"
+-  gui.party-launch-kit: "키트 선택"
+-  gui.party-launch-kit-lore: "클릭하면 키트 선택이 열립니다 (선택 시 빨강 vs 파랑 전투 시작)."
+-  gui.party-launch-mode: "배틀 모드 선택"
+-  gui.party-launch-mode-lore: "Party Fight(빨강 vs 파랑) 또는 Party FFA."
+-  gui.party-launch-mode-current: "모드: <mode>"
+-  gui.battle-mode-fight: "Party Fight"
+-  gui.battle-mode-fight-lore: "기존의 파티 배틀. 키트와 맵을 골라 빨강 vs 파랑으로 싸웁니다."
+-  gui.battle-mode-ffa: "Party FFA"
+-  gui.battle-mode-ffa-lore: "프라이빗 FFA. 파티 전용 구역에서 전원 배틀로열."
+-  gui.party-launch-go: "전투 시작"
+-  gui.party-launch-go-fight-lore: "빨강 vs 파랑 파티 배틀을 시작합니다."
+-  gui.party-launch-go-ffa-lore: "파티 전원을 프라이빗 FFA로 보냅니다."
+-  gui.party-ffa-too-few: "<red>Party FFA에는 여유 있는 멤버가 2명 이상 필요합니다.</red>"
+-  gui.party-ffa-failed: "<red>Party FFA를 시작할 수 없습니다.</red>"
++  party-launch-title: "파티 배틀"
++  party-launch-kit: "키트 선택"
++  party-launch-kit-lore: "클릭하면 키트 선택이 열립니다 (선택 시 빨강 vs 파랑 전투 시작)."
++  party-launch-mode: "배틀 모드 선택"
++  party-launch-mode-lore: "Party Fight(빨강 vs 파랑) 또는 Party FFA."
++  party-launch-mode-current: "모드: <mode>"
++  battle-mode-fight: "Party Fight"
++  battle-mode-fight-lore: "기존의 파티 배틀. 키트와 맵을 골라 빨강 vs 파랑으로 싸웁니다."
++  battle-mode-ffa: "Party FFA"
++  battle-mode-ffa-lore: "프라이빗 FFA. 파티 전용 구역에서 전원 배틀로열."
++  party-launch-go: "전투 시작"
++  party-launch-go-fight-lore: "빨강 vs 파랑 파티 배틀을 시작합니다."
++  party-launch-go-ffa-lore: "파티 전원을 프라이빗 FFA로 보냅니다."
++  party-ffa-too-few: "<red>Party FFA에는 여유 있는 멤버가 2명 이상 필요합니다.</red>"
++  party-ffa-failed: "<red>Party FFA를 시작할 수 없습니다.</red>"
+   party-none-lore: "Use the buttons above to create one"
+   admin-hub-lore-1: "Day-to-day setup is done from this UI"
+   admin-hub-lore-2: "Commands are for emergencies and advanced settings"
+@@ -1465,6 +1468,33 @@ gui:
+   request-inbox-duel-raison: "랭크 / 일반"
+   request-inbox-duel-hint: "왼쪽 클릭 수락 · 오른쪽 클릭 거절"
+   request-inbox-generic-hint: "왼쪽 클릭 수락 · 오른쪽 클릭 거절"
++# start-effects deposit UI (en fallback)
++  kit-save-done: "Kit saved"
++  start-effects-hint: "Put your potions here"
++  start-effects-hint-lore-1: "Drop normal/splash/lingering potions into the band above,"
++  start-effects-hint-lore-2: "then press Save — effect, level and duration are kept."
++  start-effects-save: "Save (apply effects)"
++  start-effects-clear: "Clear all"
++  start-effects-saved: "Start effects saved: <n> kind(s) / <rejected> non-potion item(s) returned"
++  trim-free-kit-bound: "Free perk: kit “<kit>” is now your full-trim slot"
++  trim-free-note-unset: "Free perk: VIP trim range on ONE kit of your choice (locks on first apply)"
++  trim-free-note-bound: "Free perk slot: VIP range only on “<kit>”"
++  party-map-chip: "Change map"
++  party-map-chip-hint: "Click: pick a party map (does not start the battle)"
++  party-map-click: "Click: pick this map (back to kit select)"
++  party-start-kit: "Start battle: <kit>"
++  party-start-orig: "Start battle: my Original Kit"
++  party-selected-orig: "Selected: owner’s Original Kit (rules included)"
++  party-selected-inner: "Preset: <inner>"
++  party-pick-first: "Pick a kit first (click one)!"
++  party-select-click: "Click: select → press START to begin"
++  kit: "킷"
++  ranking: "랭킹"
++  percentile: "백분위"
++  battle-mode-title: "배틀 모드"
++  party-launch-map: "맵 선택"
++  preset-removable-hint: "플레이어가 이 항목을 삭제할 수 있게 합니다"
++  preset-more-enchant-hint: "인챈트 재료로도 사용할 수 있게 합니다"
+ lb:
+   kill-title: "<gold><b>월간 킬 랭킹</b></gold>"
+   streak-title: "<gold><b>연간 최다 연승 랭킹</b></gold>"
+@@ -1672,26 +1702,3 @@ tournament:
+   start: "토너먼트 시작"
+   start-hint: "클릭하여 토너먼트를 시작합니다"
+   owner-only-lore: "토너먼트를 설정할 수 있는 사람은 팀장뿐입니다."
+-# start-effects deposit UI (en fallback)
+-  gui.kit-save-done: "Kit saved"
+-  gui.start-effects-hint: "Put your potions here"
+-  gui.start-effects-hint-lore-1: "Drop normal/splash/lingering potions into the band above,"
+-  gui.start-effects-hint-lore-2: "then press Save — effect, level and duration are kept."
+-  gui.start-effects-save: "Save (apply effects)"
+-  gui.start-effects-clear: "Clear all"
+-  gui.start-effects-saved: "Start effects saved: <n> kind(s) / <rejected> non-potion item(s) returned"
+-  gui.trim-free-kit-bound: "Free perk: kit “<kit>” is now your full-trim slot"
+-  gui.trim-free-note-unset: "Free perk: VIP trim range on ONE kit of your choice (locks on first apply)"
+-  gui.trim-free-note-bound: "Free perk slot: VIP range only on “<kit>”"
+-  party.invite-online-label: "Available online"
+-  party.invite-sent: "Invite sent — click again to cancel"
+-  party.invite-revoke-hint: "Click: cancel the invite"
+-  gui.party-map-chip: "Change map"
+-  gui.party-map-chip-hint: "Click: pick a party map (does not start the battle)"
+-  gui.party-map-click: "Click: pick this map (back to kit select)"
+-  gui.party-start-kit: "Start battle: <kit>"
+-  gui.party-start-orig: "Start battle: my Original Kit"
+-  gui.party-selected-orig: "Selected: owner’s Original Kit (rules included)"
+-  gui.party-selected-inner: "Preset: <inner>"
+-  gui.party-pick-first: "Pick a kit first (click one)!"
+-  gui.party-select-click: "Click: select → press START to begin"
+diff --git a/src/main/resources/lang/zh_cn.yml b/src/main/resources/lang/zh_cn.yml
+index 057abaa..6883b6e 100644
+--- a/src/main/resources/lang/zh_cn.yml
++++ b/src/main/resources/lang/zh_cn.yml
+@@ -81,8 +81,8 @@ menu:
+   save: "保存"
+   apply: "应用"
+   confirm: "确认"
+-  yes: "是"
+-  no: "否"
++  "yes": "是"
++  "no": "否"
+   delete: "删除"
+ 
+ party:
+@@ -213,7 +213,6 @@ party:
+   decline-hover: "拒绝该邀请"
+   no-team-named: "<red>没有名为 '<name>' 的公开队伍。"
+   joined: "<aqua><player> 加入了队伍。"
+-  same-ip-notice: "<yellow>与你使用同一网络的玩家正在此排位队列中等待；同一IP的玩家在排位中不会被匹配到一起。"
+ 
+   declined-owner: "<yellow><player> 拒绝了邀请。"
+   declined-self: "<gray>已拒绝邀请。"
+@@ -308,6 +307,9 @@ party:
+   hotbar-settings: "派对设置"
+   hotbar-settings-hint: "仅队长 — 规则与危险操作"
+ 
++  invite-online-label: "Available online"
++  invite-sent: "Invite sent — click again to cancel"
++  invite-revoke-hint: "Click: cancel the invite"
+ general:
+   prefix: ""
+   maintenance: "<red>练习场正在维护中。"
+@@ -321,16 +323,6 @@ general:
+   loading: "<gray>加载中，请稍候……"
+   mode-ranked: "排位"
+   mode-unranked: "休闲"
+-  kb-select: "<white>KB: <kb>"
+-  kb-default-name: "默认（默认KB：<name>）"
+-  kb-off-name: "不更改KB"
+-  kb-title: "选择KB配置"
+-  kb-select-lore: "<gray>点击以从列表中选择。"
+-  kb-default-lore: "<gray>使用服务器默认KB进行对战。"
+-  kb-off-lore: "<gray>不应用任何配置（保持原版）。"
+-  kb-profile-lore: "<gray>水平 ×<h> / 垂直 ×<v>"
+-  kb-empty: "尚未安装配置"
+-  kb-empty-lore: "<gray>将配置JSON放入 plugins/n-arena/kb/ 即可添加。"
+ 
+ 
+ duel:
+@@ -393,6 +385,16 @@ duel-gui:
+   combat-mode-lore-java: "Java: cooldown, sweep attacks."
+   combat-mode-lore-bedrock: "Bedrock: fast clicks, no cooldown."
+ 
++  kb-select: "<white>KB: <kb>"
++  kb-default-name: "默认（默认KB：<name>）"
++  kb-off-name: "不更改KB"
++  kb-title: "选择KB配置"
++  kb-select-lore: "<gray>点击以从列表中选择。"
++  kb-default-lore: "<gray>使用服务器默认KB进行对战。"
++  kb-off-lore: "<gray>不应用任何配置（保持原版）。"
++  kb-profile-lore: "<gray>水平 ×<h> / 垂直 ×<v>"
++  kb-empty: "尚未安装配置"
++  kb-empty-lore: "<gray>将配置JSON放入 plugins/n-arena/kb/ 即可添加。"
+ ffa:
+   maintenance: "<red>练习场正在维护中。"
+   unavailable: "<red>FFA 当前不可用。"
+@@ -482,6 +484,7 @@ queue:
+   kit-disabled: "<red>该套件队列当前已禁用。"
+   cannot-join: "<red>你现在无法加入队列。"
+   already-queued: "<red>你已经在一个队列中。"
++  same-ip-notice: "<yellow>与你使用同一网络的玩家正在此排位队列中等待；同一IP的玩家在排位中不会被匹配到一起。"
+   slow-down: "<red>太快了——请稍后再试。"
+   high-ping: "<red>你的延迟 (<ping>ms) 过高，无法排位（上限 <max>ms）。"
+   ranked-locked: "<red>排位队列目前已锁定。（<count>/<threshold> 名独立玩家已加入）"
+@@ -1147,21 +1150,21 @@ gui:
+   party-danger: "危险操作"
+   party-danger-lore: "转让 ownership、解散队伍、重置分组。"
+   update-data: "刷新数据"
+-  gui.party-launch-title: "队伍对战"
+-  gui.party-launch-kit: "选择套件"
+-  gui.party-launch-kit-lore: "点击打开套件选择（选择后即开始红vs蓝对战）。"
+-  gui.party-launch-mode: "选择对战模式"
+-  gui.party-launch-mode-lore: "Party Fight（红vs蓝）或 Party FFA。"
+-  gui.party-launch-mode-current: "模式：<mode>"
+-  gui.battle-mode-fight: "Party Fight"
+-  gui.battle-mode-fight-lore: "传统的队伍对战：自选套件与地图，红vs蓝。"
+-  gui.battle-mode-ffa: "Party FFA"
+-  gui.battle-mode-ffa-lore: "私人FFA：全队在专属区域自由混战。"
+-  gui.party-launch-go: "开始对战"
+-  gui.party-launch-go-fight-lore: "开始红vs蓝的队伍对战。"
+-  gui.party-launch-go-ffa-lore: "将全队送入私人FFA。"
+-  gui.party-ffa-too-few: "<red>Party FFA至少需要2名空闲成员。</red>"
+-  gui.party-ffa-failed: "<red>无法开始Party FFA。</red>"
++  party-launch-title: "队伍对战"
++  party-launch-kit: "选择套件"
++  party-launch-kit-lore: "点击打开套件选择（选择后即开始红vs蓝对战）。"
++  party-launch-mode: "选择对战模式"
++  party-launch-mode-lore: "Party Fight（红vs蓝）或 Party FFA。"
++  party-launch-mode-current: "模式：<mode>"
++  battle-mode-fight: "Party Fight"
++  battle-mode-fight-lore: "传统的队伍对战：自选套件与地图，红vs蓝。"
++  battle-mode-ffa: "Party FFA"
++  battle-mode-ffa-lore: "私人FFA：全队在专属区域自由混战。"
++  party-launch-go: "开始对战"
++  party-launch-go-fight-lore: "开始红vs蓝的队伍对战。"
++  party-launch-go-ffa-lore: "将全队送入私人FFA。"
++  party-ffa-too-few: "<red>Party FFA至少需要2名空闲成员。</red>"
++  party-ffa-failed: "<red>无法开始Party FFA。</red>"
+   party-none-lore: "用上方按钮创建一个吧"
+   admin-hub-lore-1: "日常设置都在此界面完成"
+   admin-hub-lore-2: "命令用于紧急情况与高级设置"
+@@ -1465,6 +1468,33 @@ gui:
+   request-inbox-duel-raison: "排位 / 普通"
+   request-inbox-duel-hint: "左键接受，右键拒绝"
+   request-inbox-generic-hint: "左键接受，右键拒绝"
++# start-effects deposit UI (en fallback)
++  kit-save-done: "Kit saved"
++  start-effects-hint: "Put your potions here"
++  start-effects-hint-lore-1: "Drop normal/splash/lingering potions into the band above,"
++  start-effects-hint-lore-2: "then press Save — effect, level and duration are kept."
++  start-effects-save: "Save (apply effects)"
++  start-effects-clear: "Clear all"
++  start-effects-saved: "Start effects saved: <n> kind(s) / <rejected> non-potion item(s) returned"
++  trim-free-kit-bound: "Free perk: kit “<kit>” is now your full-trim slot"
++  trim-free-note-unset: "Free perk: VIP trim range on ONE kit of your choice (locks on first apply)"
++  trim-free-note-bound: "Free perk slot: VIP range only on “<kit>”"
++  party-map-chip: "Change map"
++  party-map-chip-hint: "Click: pick a party map (does not start the battle)"
++  party-map-click: "Click: pick this map (back to kit select)"
++  party-start-kit: "Start battle: <kit>"
++  party-start-orig: "Start battle: my Original Kit"
++  party-selected-orig: "Selected: owner’s Original Kit (rules included)"
++  party-selected-inner: "Preset: <inner>"
++  party-pick-first: "Pick a kit first (click one)!"
++  party-select-click: "Click: select → press START to begin"
++  kit: "套件"
++  ranking: "排行榜"
++  percentile: "百分位"
++  battle-mode-title: "对战模式"
++  party-launch-map: "选择地图"
++  preset-removable-hint: "允许玩家删除此项目"
++  preset-more-enchant-hint: "也可作为附魔材料使用"
+ lb:
+   kill-title: "<gold><b>月度击杀榜</b></gold>"
+   streak-title: "<gold><b>年度连胜榜</b></gold>"
+@@ -1672,26 +1702,3 @@ tournament:
+   start: "开始锦标赛"
+   start-hint: "点击启动淘汰赛"
+   owner-only-lore: "只有队长可以配置锦标赛。"
+-# start-effects deposit UI (en fallback)
+-  gui.kit-save-done: "Kit saved"
+-  gui.start-effects-hint: "Put your potions here"
+-  gui.start-effects-hint-lore-1: "Drop normal/splash/lingering potions into the band above,"
+-  gui.start-effects-hint-lore-2: "then press Save — effect, level and duration are kept."
+-  gui.start-effects-save: "Save (apply effects)"
+-  gui.start-effects-clear: "Clear all"
+-  gui.start-effects-saved: "Start effects saved: <n> kind(s) / <rejected> non-potion item(s) returned"
+-  gui.trim-free-kit-bound: "Free perk: kit “<kit>” is now your full-trim slot"
+-  gui.trim-free-note-unset: "Free perk: VIP trim range on ONE kit of your choice (locks on first apply)"
+-  gui.trim-free-note-bound: "Free perk slot: VIP range only on “<kit>”"
+-  party.invite-online-label: "Available online"
+-  party.invite-sent: "Invite sent — click again to cancel"
+-  party.invite-revoke-hint: "Click: cancel the invite"
+-  gui.party-map-chip: "Change map"
+-  gui.party-map-chip-hint: "Click: pick a party map (does not start the battle)"
+-  gui.party-map-click: "Click: pick this map (back to kit select)"
+-  gui.party-start-kit: "Start battle: <kit>"
+-  gui.party-start-orig: "Start battle: my Original Kit"
+-  gui.party-selected-orig: "Selected: owner’s Original Kit (rules included)"
+-  gui.party-selected-inner: "Preset: <inner>"
+-  gui.party-pick-first: "Pick a kit first (click one)!"
+-  gui.party-select-click: "Click: select → press START to begin"
+diff --git a/tools/localtest/localtest.sh b/tools/localtest/localtest.sh
+index e1fbfe7..284d675 100755
+--- a/tools/localtest/localtest.sh
++++ b/tools/localtest/localtest.sh
+@@ -103,7 +103,7 @@ fi
+ # warning into a CI failure far from the file that caused it.
+ if python3 -c 'import yaml' 2>/dev/null; then
+   python3 - "$ROOT/src/main/resources" <<'PY' || exit 1
+-import glob, os, sys, yaml
++import glob, os, re, sys, yaml
+ 
+ class Loader(yaml.SafeLoader):
+     pass
+@@ -163,6 +163,39 @@ if sets:
+     if not failed:
+         print('yaml-ok %d locales share the same %d keys' % (len(sets), len(base)))
+ 
++# The plugin reads messages back with YamlConfiguration.getString(path), which splits the path
++# on '.'. A key that repeats its section name ("gui.foo:" inside the gui: section) is therefore
++# stored as gui.gui.foo and the code's lookup misses, printing "!gui.foo!" in a GUI. Checking
++# every declared key resolves is exact: no heuristics, no false alarms.
++REACHABLE = re.compile(r'^[a-z][a-z0-9_-]*$', re.I)
++def resolves(document, path):
++    node = document
++    for part in path.split('.'):
++        if not isinstance(node, dict) or part not in node:
++            return False
++        node = node[part]
++    return isinstance(node, str)
++
++for label, keys in sorted(sets.items()):
++    locale_file = os.path.join(root, label.replace('/', os.sep))
++    with open(locale_file, encoding='utf-8') as handle:
++        document = yaml.load(handle, Loader=Loader) or {}
++    dead = [k for k in sorted(keys) if not resolves(document, k)]
++    if dead:
++        failed = True
++        print('local-test: FAIL \u2014 %s declares %d key(s) the message loader can never '
++              'resolve (a key must not repeat its own section name, and must sit in the '
++              'section the code asks for): %s' % (label, len(dead), dead[:5]), file=sys.stderr)
++    with open(locale_file, encoding='utf-8') as handle:
++        for number, line in enumerate(handle, 1):
++            key_part = line.split(':', 1)[0].strip()
++            if not key_part or key_part[0] in '\'"' or ' ' in key_part:
++                continue
++            if key_part.lower() in ('y', 'yes', 'on', 'true', 'n', 'no', 'off', 'false'):
++                print('local-test: WARNING \u2014 %s line %d: "%s" is a YAML 1.1 boolean; '
++                      'quote the key or the loader stores it as true/false'
++                      % (label, number, key_part), file=sys.stderr)
++
+ sys.exit(1 if failed else 0)
+ PY
+ else
+diff --git a/tools/parity-runner/build_plugin.sh b/tools/parity-runner/build_plugin.sh
+index 18cefbf..edffa48 100755
+--- a/tools/parity-runner/build_plugin.sh
++++ b/tools/parity-runner/build_plugin.sh
+@@ -76,24 +76,51 @@ SOURCES=(
+   src/main/java/com/rumilance/practice/team/TeamService.java
+   src/main/java/com/rumilance/practice/team/OriginalKitRef.java
+   src/main/java/com/rumilance/practice/util/PlayerVitals.java
++  # 2026-10 のデバッグ修正で変更/追加したファイル。ここを忘れると「ソースは直って
++  # いるのに delivery jar の古いクラスが動く」状態になるので必ず同コンパイルする。
++  src/main/java/com/rumilance/practice/combat/CombatStyleService.java
++  src/main/java/com/rumilance/practice/combat/LethalPresentationService.java
++  src/main/java/com/rumilance/practice/combat/LethalPresentationPackets.java
++  src/main/java/com/rumilance/practice/command/DuelCommand.java
++  src/main/java/com/rumilance/practice/cosmetic/TrimAllowanceService.java
++  src/main/java/com/rumilance/practice/gui/menus/EditKitGui.java
++  src/main/java/com/rumilance/practice/gui/menus/PartyBattleModeGui.java
++  src/main/java/com/rumilance/practice/gui/menus/SettingsGui.java
++  src/main/java/com/rumilance/practice/gui/menus/TeamHubGui.java
++  src/main/java/com/rumilance/practice/lobby/LobbyService.java
++  src/main/java/com/rumilance/practice/practice/BotFightHarness.java
++  src/main/java/com/rumilance/practice/practice/PracticeSession.java
++  src/main/java/com/rumilance/practice/queue/QueueService.java
+   # @NotNull/@Nullable の最小スタブ (annotations jar が無い環境用)
+   tools/parity-runner/stubs/org/jetbrains/annotations
+ )
+ 
+-CP="$DELIVERY:$PAPER_JAR:$(find "$LIBS_DIR" -name '*.jar' 2>/dev/null | tr '\n' ':')$(find "$SERVER_LIBS_DIR" -name '*.jar' 2>/dev/null | tr '\n' ':')"
++# PacketEvents / WorldEdit(FAWE) / LuckPerms はサンドボックスに jar が無いので、
++# コンパイル専用スタブの classes ディレクトリを STUB_CLASSES で渡せるようにしておく
++# (生成はワークスペースの harness/make_stubs*.py)。未指定なら従来どおり。
++CP="$DELIVERY:$PAPER_JAR:${STUB_CLASSES:-}:$(find "$LIBS_DIR" -name '*.jar' 2>/dev/null | tr '\n' ':')$(find "$SERVER_LIBS_DIR" -name '*.jar' 2>/dev/null | tr '\n' ':')"
+ 
+ rm -rf /tmp/plugbuild/one
+ mkdir -p /tmp/plugbuild/one "$(dirname "$OUT")"
+ 
++# 上の SOURCES は「delivery jar を焼いた時点から変更したファイル」の記録だが、ここに
++# 挙げ忘れると *古いクラスが動き続ける*(このファイル自身が何度も警告しているとおり)。
++# 取りこぼしを原理的に無くすため、既定では src/main/java 全体をコンパイルして丸ごと
++# 上書きする。展開に失敗するのは shadow の relocate 前の名前を直接書いているソースだけ
++# なので、それらだけ delivery jar 側(relocate 済み)のクラスを残す。
++RELOCATED_DEPS=(
++  src/main/java/com/rumilance/practice/database/DatabaseService.java
++)
+ FILES=()
+-for s in "${SOURCES[@]}"; do
+-  if [ -d "$ROOT/$s" ]; then
+-    while IFS= read -r f; do FILES+=("$f"); done < <(find "$ROOT/$s" -name '*.java')
+-  else
+-    FILES+=("$ROOT/$s")
+-  fi
+-done
+-echo "compiling ${#FILES[@]} source file(s) ..."
++while IFS= read -r f; do
++  skip=0
++  for rel in "${RELOCATED_DEPS[@]}"; do
++    [ "$ROOT/$rel" = "$f" ] && skip=1
++  done
++  [ "$skip" = 0 ] && FILES+=("$f")
++done < <(find "$ROOT/src/main/java" -name '*.java' | sort)
++echo "compiling ${#FILES[@]} source file(s) (all of src/main/java; relocated-dependency files kept from the base jar) ..."
++echo "  base jar: $DELIVERY ($(unzip -p "$DELIVERY" plugin.yml 2>/dev/null | awk '/^version:/{print $2}')) / sources: $(grep -m1 '^version' "$ROOT/gradle.properties" | cut -d= -f2)"
+ "$JDK/bin/javac" -nowarn -proc:none -d /tmp/plugbuild/one -cp "$CP" "${FILES[@]}"
+ 
+ echo "classes: $(find /tmp/plugbuild/one -name '*.class' | wc -l)"
+@@ -103,14 +130,11 @@ cp "$DELIVERY" "$OUT"
+ # (plugin.yml は gradle の ${version} 置換済みが無いので jar 内のもので良し)。
+ chmod -R u+w /tmp/plugbuild/res 2>/dev/null || true   # tar 由来の read-only ディレクトリに負けない
+ rm -rf /tmp/plugbuild/res
+-mkdir -p /tmp/plugbuild/res/lang
+-cp "$ROOT/src/main/resources/config.yml" /tmp/plugbuild/res/
+-cp "$ROOT/src/main/resources/quantum.yml" /tmp/plugbuild/res/
+-cp "$ROOT"/src/main/resources/lang/*.yml /tmp/plugbuild/res/lang/
+-# jar 内蔵マップパック (QuantumRuntime.extractBundledPack が起動時に展開する)
+-if [ -d "$ROOT/src/main/resources/quantum-pack" ]; then
+-  cp -r "$ROOT/src/main/resources/quantum-pack" /tmp/plugbuild/res/
+-fi
++mkdir -p /tmp/plugbuild/res
++# リソースは src/main/resources を丸ごと重ねる(plugin.yml だけは gradle の
++# ${version} 置換前なので jar 内のもの=置換済みを残す)。
++cp -a "$ROOT/src/main/resources/." /tmp/plugbuild/res/
++rm -f /tmp/plugbuild/res/plugin.yml
+ ( cd /tmp/plugbuild/res && "$JDK/bin/jar" uf "$OUT" . )
+ echo "built $OUT"
+ sha256sum "$OUT"
+diff --git a/tools/parity-runner/env_up.sh b/tools/parity-runner/env_up.sh
+index b467002..b374e28 100755
+--- a/tools/parity-runner/env_up.sh
++++ b/tools/parity-runner/env_up.sh
+@@ -24,7 +24,7 @@ START=0
+ log() { echo "== $*"; }
+ 
+ # ---------------------------------------------------------------- 1. delivery blobs
+-if [ ! -f "$DL/RumilancePractice-1.76.27.jar" ] || [ ! -f "$DL/jdk21.tar.gz.part-00" ]; then
++if ! ls "$DL"/RumilancePractice-*.jar >/dev/null 2>&1 || [ ! -f "$DL/jdk21.tar.gz.part-00" ]; then
+   log "delivery ブランチを取得"
+   git -C "$ROOT" fetch origin '+refs/heads/*:refs/remotes/origin/*' --quiet
+   mkdir -p "$DL"
+@@ -85,7 +85,10 @@ set_props "$FAB/server.properties" server-port 25565
+ log "プラグインをビルド"
+ PLUGIN="$PAPER/plugins/RumilancePractice.jar"
+ mkdir -p "$PAPER/plugins"
+-JDK="$JDK" DELIVERY="$DL/RumilancePractice-1.76.27.jar" \
++# plugin-delivery は更新のたびに jar 名(=バージョン)が変わるので、決め打ちせず
++# ある中で一番新しいものを使う(1.76.27 決め打ちで env_up が動かなくなっていた)。
++DELIVERY_JAR="$(ls "$DL"/RumilancePractice-*.jar 2>/dev/null | sort -V | tail -1)"
++JDK="$JDK" DELIVERY="$DELIVERY_JAR" \
+   PAPER_JAR="/tmp/papersrv/paper-run/versions/1.21.11/paper-1.21.11.jar" \
+   "$ROOT/tools/parity-runner/build_plugin.sh" "$PLUGIN" >/tmp/build_plugin.log 2>&1 || {
+     tail -30 /tmp/build_plugin.log; exit 1; }
+diff --git a/tools/parity-runner/server_preset.py b/tools/parity-runner/server_preset.py
+index 6d5b88d..63f6831 100644
+--- a/tools/parity-runner/server_preset.py
++++ b/tools/parity-runner/server_preset.py
+@@ -105,6 +105,13 @@ def apply(run_dir):
+     print('適用: %s (bot-mode-kits)' % (run_dir / 'plugins' / 'n-arena' / 'practices.yml'))
+     mode = (FIXTURES / 'parity-quantum-mode.txt').read_text().strip()
+     qy = run_dir / 'plugins' / 'NARENA' / 'quantum.yml'
++    if not qy.is_file():
++        # まだ一度も起動していない実行ディレクトリでは quantum.yml が無い(プラグインが
++        # boot 時に生成する)。ここで落とすと env_up の最初の 1 回だけ失敗し、以後
++        # 「起動後にもう一度 apply する」手順に頼ることになるので、無い場合は
++        # その旨を出して他ファイルだけ適用し、起動後に再実行してもらう。
++        print('スキップ: %s はまだ無い(未起動)。起動後に apply を再実行すること。' % qy)
++        return 0
+     text = qy.read_text()
+     # bot: が複数あるので「最後の bot: ブロック」の mode を書き換える(YAML は後勝ち)。
+     idx = text.rfind('\nbot:')
+diff --git a/tools/plugin_bot_report.py b/tools/plugin_bot_report.py
+index c18a244..580d651 100644
+--- a/tools/plugin_bot_report.py
++++ b/tools/plugin_bot_report.py
+@@ -54,7 +54,8 @@ def plugin_stats(path: str) -> dict:
+             samples += 1
+             m2 = re.search(r"\bi=([A-Za-z_]+)", line)
+             if m2:
+-                items[m2.group(1) or "-"] += 1
++                # Bukkit enum 名で来るので小文字化(参照側 id と突き合わせるため)。
++                items[(m2.group(1) or "-").lower()] += 1
+             continue
+         m = TRACE.search(line)
+         if m and not m.group(2).startswith("s p="):
+@@ -143,7 +144,9 @@ def ref_stats(path: str) -> dict:
+ 
+     pearl, anchor, charge = uses("pc"), uses("anc"), uses("chg")
+     detonate, crystal, hitcd = uses("exp"), uses("ct"), uses("hit")
+-    items: Counter[str] = Counter(r["i"].replace("minecraft:", "") for r in rows if "i" in r)
++    # Bukkit の enum 名 (ENDER_PEARL) と参照側の id (ender_pearl) を同じ土台に載せる。
++    items: Counter[str] = Counter(
++        r["i"].replace("minecraft:", "").lower() for r in rows if "i" in r)
+     total = sum(items.values()) or 1
+     return {
+         "source": "reference",
+diff --git a/tools/plugin_runtime.md b/tools/plugin_runtime.md
+index 846cf64..e2eb14d 100644
+--- a/tools/plugin_runtime.md
++++ b/tools/plugin_runtime.md
+@@ -90,3 +90,27 @@ python3 tools/fight_timeline.py /tmp/run_<version>.log /tmp/run_<version>.png
+ + qlog データパック入りのサーバーが得られる(未検証: このメモを書いた時点では未展開)。
+ 参照の戦闘は `/tmp/ref_dist_run.log` 形式(`[q] … t=… d2=… i=…`)で `logs/latest.log` に
+ 毎 tick 出力されるので、`tail -F … | grep '\[q\]' > /tmp/ref_run.log` で採取する。
++
++## 8. 既知の穴: パリティ(Fabric 参照 ↔ Paper 移植)の Paper 側は bot が動かない
++
++実測(2026-10・サンドボックス再構築後): `tools/parity-runner/env_up.sh --start` →
++`pair.sh dbg sword_k10v11 30 15` → `parity_verify.py` は **Paper 側だけ全指標 0**
++(swing/speed/move_share/x_span/z_span が 0、hp は 20 のまま)になる。Fabric 側は普通に戦う。
++
++- 原因は移植側の tick 所有権。`QuantumFunctionRegistry.filteredTags()` がパックの
++  `minecraft:tick`/`load` を落とし、`baseTags()` も `quantum:tick`/`quantum:load`/`stats:tick`
++  を `#minecraft:tick` から除外する(＝グローバル bot の入口は意図的に閉じている)。
++  実際に tick を回しているのは `QuantumRuntime.tickInstances()` の **インスタンス登録済み
++  bot だけ**。ところがパリティのシナリオは map の `playerspawn` で bot を出す
++  (`parity:setup/*` 36〜37 行目)ので、`HeroBotRegistry.spawn()` → `quantum_bot` タグだけが
++  付いて **どのインスタンスにも属さない** ⇒ 1 tick も動かない。
++  なお `QuantumRuntime.despawnBot()` のコメント自身が「/playerspawn-created bots are outside
++  the Quantum instance manager」と書いており、既知の設計状態。
++- したがって Paper 側の parity 数値を「移植の乖離」として読んではいけない。プラグイン側の
++  実力を見るには `-Drumilance.harness=true` の `narena-harness`(practice bot 戦)を使う
++  (このメモの 5〜6 節)。実測では 145s で pearl 59.2/min・anchor place 40.6/min・
++  charge 24.4/min・detonate 18.6/min・crystal 5.8/min・sword hit 11.2/min。
++- 直すなら「`playerspawn` で出た bot を runtime が adopt する」方向(グローバルの
++  tick タグを復活させると、複数試合が互いの xlib_* タグを取り合う元のバグに戻る)。
++  runtime は target=実プレイヤー前提なので、bot 対 bot のパリティを通すには
++  target を偽プレイヤーにも許す改修が要る。
